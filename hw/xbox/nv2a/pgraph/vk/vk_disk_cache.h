@@ -46,13 +46,24 @@ static inline char *xemu_vk_disk_cache_path(const char *subdir,
     if (!dir) {
         return NULL;
     }
-    if (g_mkdir_with_parents(dir, 0700) != 0) {
-        g_free(dir);
-        return NULL;
-    }
+    /* Read-only lookups must not create directories.  Apart from unnecessary
+     * filesystem metadata work, this is especially expensive on Windows when
+     * the Vulkan backend has hundreds of shader-cache subdirectories. */
     char *path = g_build_filename(dir, name, NULL);
     g_free(dir);
     return path;
+}
+
+/* Only new cache entries need their parent directory to be created. */
+static inline gboolean xemu_vk_disk_cache_prepare_write(const char *path)
+{
+    if (!path) {
+        return FALSE;
+    }
+    char *dir = g_path_get_dirname(path);
+    gboolean ok = g_mkdir_with_parents(dir, 0700) == 0;
+    g_free(dir);
+    return ok;
 }
 
 /* Hash the complete GLSL plus all compiler options which affect SPIR-V. */
@@ -144,7 +155,8 @@ static inline GByteArray *xemu_vk_spv_cache_load(const char *path)
 static inline gboolean xemu_vk_spv_cache_save(const char *path,
                                                const GByteArray *spv)
 {
-    if (!path || !spv || !xemu_vk_spv_valid(spv->data, spv->len)) {
+    if (!path || !spv || !xemu_vk_spv_valid(spv->data, spv->len) ||
+        !xemu_vk_disk_cache_prepare_write(path)) {
         return FALSE;
     }
     guint8 header[XEMU_VK_SPV_HEADER_BYTES] = { 0 };
@@ -224,27 +236,57 @@ static inline GByteArray *xemu_vk_pipeline_cache_load(
     return result;
 }
 
+/* Persist the driver-provided VkPipelineCache without changing any pipeline
+ * creation or NV2A command behavior.  This is also invoked at rare pipeline
+ * creation milestones: xemu can terminate without Vulkan renderer teardown. */
 static inline void xemu_vk_pipeline_cache_save(
     VkDevice device, VkPipelineCache cache, const VkPhysicalDeviceProperties *p)
 {
     if (!xemu_vk_disk_cache_enabled() || cache == VK_NULL_HANDLE) {
         return;
     }
-    size_t size = 0;
-    if (vkGetPipelineCacheData(device, cache, &size, NULL) != VK_SUCCESS ||
-        size < 32 || size > XEMU_VK_PIPELINE_MAX_BYTES) {
+
+    /* Some drivers always return the header and no payload.  This is legal;
+     * don't claim that a useful pipeline cache was saved in that case. */
+    static gboolean reported_header_only;
+    for (unsigned attempt = 0; attempt < 3; attempt++) {
+        size_t capacity = 0;
+        VkResult result = vkGetPipelineCacheData(device, cache, &capacity, NULL);
+        if (result != VK_SUCCESS || capacity < 32 ||
+            capacity > XEMU_VK_PIPELINE_MAX_BYTES) {
+            return;
+        }
+        guint8 *bytes = g_malloc(capacity);
+        size_t written = capacity;
+        result = vkGetPipelineCacheData(device, cache, &written, bytes);
+        if (result == VK_INCOMPLETE) {
+            g_free(bytes);
+            continue; /* cache grew between size query and retrieval */
+        }
+        if (result == VK_SUCCESS &&
+            xemu_vk_pipeline_cache_blob_valid(bytes, written, p)) {
+            if (written == 32) {
+                if (!reported_header_only) {
+                    fprintf(stderr, "xemu/vk: Vulkan driver returned a "
+                            "header-only pipeline cache (no reusable data)\n");
+                    reported_header_only = TRUE;
+                }
+                g_free(bytes);
+                return;
+            }
+            char *path = xemu_vk_pipeline_cache_path(p);
+            if (xemu_vk_disk_cache_prepare_write(path) &&
+                g_file_set_contents(path, (const char *)bytes, written, NULL)) {
+                fprintf(stderr, "xemu/vk: saved pipeline cache (%zu bytes)\n",
+                        written);
+            }
+            g_free(path);
+            g_free(bytes);
+            return;
+        }
+        g_free(bytes);
         return;
     }
-    guint8 *bytes = g_malloc(size);
-    if (vkGetPipelineCacheData(device, cache, &size, bytes) == VK_SUCCESS &&
-        xemu_vk_pipeline_cache_blob_valid(bytes, size, p)) {
-        char *path = xemu_vk_pipeline_cache_path(p);
-        if (path && g_file_set_contents(path, (const char *)bytes, size, NULL)) {
-            fprintf(stderr, "xemu/vk: saved pipeline cache (%zu bytes)\n", size);
-        }
-        g_free(path);
-    }
-    g_free(bytes);
 }
 
 #endif /* XEMU_VK_DISK_CACHE_V1_H */

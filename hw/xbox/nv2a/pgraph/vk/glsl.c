@@ -253,8 +253,11 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(PGRAPHVkState *r,
         return NULL;
     }
 
+    /* The driver validates submitted shaders itself.  Avoid a second
+     * SPIR-V validation pass in normal Release gameplay; retain it when
+     * Vulkan shader debugging is enabled.  Emitted SPIR-V is unchanged. */
     glslang_spv_options_t spv_options = {
-        .validate = true,
+        .validate = g_config.display.vulkan.debug_shaders,
     };
 
     if (g_config.display.vulkan.debug_shaders) {

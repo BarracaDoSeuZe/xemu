@@ -122,9 +122,37 @@ static bool pipeline_cache_entry_compare(Lru *lru, LruNode *node,
     return memcmp(&snode->key, key, sizeof(PipelineKey));
 }
 
+/* Avoid losing the driver pipeline cache if the emulator exits without
+ * running pgraph_vk_finalize_pipelines().  Take only sparse checkpoints,
+ * immediately after creation (never inside a draw/queue submission). */
+static unsigned int vk_pipeline_creations_since_init;
+static unsigned int vk_pipeline_checkpoint_threshold;
+
+static void maybe_checkpoint_pipeline_cache(PGRAPHVkState *r)
+{
+    if (!xemu_vk_disk_cache_enabled()) {
+        return;
+    }
+    ++vk_pipeline_creations_since_init;
+    if (vk_pipeline_creations_since_init < vk_pipeline_checkpoint_threshold) {
+        return;
+    }
+    xemu_vk_pipeline_cache_save(r->device, r->vk_pipeline_cache,
+                                &r->device_props);
+    /* 32, 128, 512, 1024, 1536, ... Only a handful of checkpoints
+     * per play session, rather than a disk write on every pipeline. */
+    if (vk_pipeline_checkpoint_threshold < 512) {
+        vk_pipeline_checkpoint_threshold *= 4;
+    } else {
+        vk_pipeline_checkpoint_threshold += 512;
+    }
+}
+
 static void init_pipeline_cache(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
+    vk_pipeline_creations_since_init = 0;
+    vk_pipeline_checkpoint_threshold = 32;
 
     GByteArray *disk_pipeline_cache =
         xemu_vk_pipeline_cache_load(&r->device_props);
@@ -621,6 +649,10 @@ static void create_clear_pipeline(PGRAPHState *pg)
     VK_CHECK(vkCreateGraphicsPipelines(r->device, r->vk_pipeline_cache, 1,
                                        &pipeline_info, NULL, &pipeline));
 
+    /* Save a driver cache checkpoint after successful pipeline creation.
+     * No changes to the GPU command stream or emulated Xbox state. */
+    maybe_checkpoint_pipeline_cache(r);
+
     snode->pipeline = pipeline;
     snode->layout = layout;
     snode->render_pass = pipeline_info.renderPass;
@@ -1028,6 +1060,10 @@ static void create_pipeline(PGRAPHState *pg)
     VkPipeline pipeline;
     VK_CHECK(vkCreateGraphicsPipelines(r->device, r->vk_pipeline_cache, 1,
                                        &pipeline_create_info, NULL, &pipeline));
+
+    /* Save a driver cache checkpoint after successful pipeline creation.
+     * No changes to the GPU command stream or emulated Xbox state. */
+    maybe_checkpoint_pipeline_cache(r);
 
     snode->pipeline = pipeline;
     snode->layout = layout;
