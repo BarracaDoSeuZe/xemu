@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/fast-hash.h"
 #include "renderer.h"
+#include "vk_disk_cache.h"
 #include <math.h>
 
 void pgraph_vk_draw_begin(NV2AState *d)
@@ -125,15 +126,33 @@ static void init_pipeline_cache(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    GByteArray *disk_pipeline_cache =
+        xemu_vk_pipeline_cache_load(&r->device_props);
+    if (disk_pipeline_cache) {
+        fprintf(stderr, "xemu/vk: loaded pipeline cache (%zu bytes)\n",
+                (size_t)disk_pipeline_cache->len);
+    }
     VkPipelineCacheCreateInfo cache_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
         .flags = 0,
-        .initialDataSize = 0,
-        .pInitialData = NULL,
+
+        .initialDataSize = disk_pipeline_cache ? disk_pipeline_cache->len : 0,
+        .pInitialData = disk_pipeline_cache ? disk_pipeline_cache->data : NULL,
         .pNext = NULL,
     };
-    VK_CHECK(vkCreatePipelineCache(r->device, &cache_info, NULL,
-                                   &r->vk_pipeline_cache));
+    VkResult cache_result = vkCreatePipelineCache(
+        r->device, &cache_info, NULL, &r->vk_pipeline_cache);
+    if (cache_result != VK_SUCCESS && disk_pipeline_cache) {
+        fprintf(stderr, "xemu/vk: pipeline cache rejected, retrying empty\n");
+        cache_info.initialDataSize = 0;
+        cache_info.pInitialData = NULL;
+        cache_result = vkCreatePipelineCache(
+            r->device, &cache_info, NULL, &r->vk_pipeline_cache);
+    }
+    if (disk_pipeline_cache) {
+        g_byte_array_unref(disk_pipeline_cache);
+    }
+    VK_CHECK(cache_result);
 
     const size_t pipeline_cache_size = 2048;
     lru_init(&r->pipeline_cache);
@@ -157,6 +176,8 @@ static void finalize_pipeline_cache(PGRAPHState *pg)
     g_free(r->pipeline_cache_entries);
     r->pipeline_cache_entries = NULL;
 
+    xemu_vk_pipeline_cache_save(r->device, r->vk_pipeline_cache,
+                                 &r->device_props);
     vkDestroyPipelineCache(r->device, r->vk_pipeline_cache, NULL);
 }
 

@@ -23,6 +23,7 @@
 #include <assert.h>
 #include <glslang/Include/glslang_c_interface.h>
 #include <stdio.h>
+#include "vk_disk_cache.h"
 
 static const glslang_resource_t
     resource_limits = { .max_lights = 32,
@@ -130,6 +131,10 @@ static const glslang_resource_t
                             .general_constant_matrix_vector_indexing = 1,
                         } };
 
+static guint64 vk_spv_disk_hits;
+static guint64 vk_spv_disk_misses;
+static guint64 vk_spv_disk_writes;
+
 void pgraph_vk_init_glsl_compiler(void)
 {
     glslang_initialize_process();
@@ -137,6 +142,9 @@ void pgraph_vk_init_glsl_compiler(void)
 
 void pgraph_vk_finalize_glsl_compiler(void)
 {
+    fprintf(stderr, "xemu/vk SPIR-V disk cache: hits=%" G_GUINT64_FORMAT
+            " misses=%" G_GUINT64_FORMAT " writes=%" G_GUINT64_FORMAT "\n",
+            vk_spv_disk_hits, vk_spv_disk_misses, vk_spv_disk_writes);
     glslang_finalize_process();
 }
 
@@ -167,6 +175,19 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(PGRAPHVkState *r,
         target_spv = GLSLANG_TARGET_SPV_1_3;
     }
 
+    char *disk_spv_path = xemu_vk_spv_cache_path(
+        &r->device_props, (unsigned)stage, (unsigned)client_version,
+        (unsigned)target_spv, g_config.display.vulkan.debug_shaders,
+        glsl_source);
+    GByteArray *disk_spv = xemu_vk_spv_cache_load(disk_spv_path);
+    if (disk_spv) {
+        vk_spv_disk_hits++;
+        g_free(disk_spv_path);
+        return disk_spv;
+    }
+    if (disk_spv_path) {
+        vk_spv_disk_misses++;
+    }
     const glslang_input_t input = {
         .language = GLSLANG_SOURCE_GLSL,
         .stage = stage,
@@ -195,6 +216,7 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(PGRAPHVkState *r,
                 glslang_shader_get_info_debug_log(shader), input.code);
         assert(!"glslang preprocess failed");
         glslang_shader_delete(shader);
+        g_free(disk_spv_path);
         return NULL;
     }
 
@@ -209,6 +231,7 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(PGRAPHVkState *r,
                 glslang_shader_get_preprocessed_code(shader));
         assert(!"glslang parse failed");
         glslang_shader_delete(shader);
+        g_free(disk_spv_path);
         return NULL;
     }
 
@@ -226,6 +249,7 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(PGRAPHVkState *r,
         assert(!"glslang link failed");
         glslang_program_delete(program);
         glslang_shader_delete(shader);
+        g_free(disk_spv_path);
         return NULL;
     }
 
@@ -263,7 +287,12 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(PGRAPHVkState *r,
     glslang_program_delete(program);
     glslang_shader_delete(shader);
 
-    return g_byte_array_new_take(data, num_program_bytes);
+    GByteArray *compiled_spv = g_byte_array_new_take(data, num_program_bytes);
+    if (xemu_vk_spv_cache_save(disk_spv_path, compiled_spv)) {
+        vk_spv_disk_writes++;
+    }
+    g_free(disk_spv_path);
+    return compiled_spv;
 }
 
 VkShaderModule pgraph_vk_create_shader_module_from_spv(PGRAPHVkState *r, GByteArray *spv)
