@@ -25,6 +25,82 @@
 #define XEMU_VK_MIB ((VkDeviceSize)1024 * 1024)
 #define XEMU_VK_MAX_TRANSIENT_BUFFER (256 * XEMU_VK_MIB)
 
+/* V7: Keep the guest-visible NV2A limits unchanged. Only the host Vulkan
+ * vertex/index/uniform streaming pairs may grow. Compute and surface staging
+ * keep their V5/V6 sizes until their independent call sites can be audited. */
+static VkDeviceSize transient_budget_available(PGRAPHVkState *r)
+{
+    VkPhysicalDeviceMemoryProperties props;
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = { 0 };
+    VkDeviceSize host_free = 0, device_free = 0;
+
+    vkGetPhysicalDeviceMemoryProperties(r->physical_device, &props);
+    vmaGetHeapBudgets(r->allocator, budgets);
+
+    for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
+        uint32_t heap = props.memoryTypes[i].heapIndex;
+        VkMemoryPropertyFlags flags = props.memoryTypes[i].propertyFlags;
+        if (heap >= props.memoryHeapCount) {
+            continue;
+        }
+        VkDeviceSize available = budgets[heap].budget > budgets[heap].usage ?
+            budgets[heap].budget - budgets[heap].usage : 0;
+        if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+            host_free = MAX(host_free, available);
+        }
+        if (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+            device_free = MAX(device_free, available);
+        }
+    }
+
+    /* The two allocations can share the same underlying heap on an iGPU.
+     * This is a heuristic only: VMA allocations remain the authority. */
+    if (host_free && device_free) {
+        return MIN(host_free, device_free);
+    }
+    return MAX(host_free, device_free);
+}
+
+static VkDeviceSize initial_streaming_capacity(PGRAPHVkState *r,
+                                                VkDeviceSize desired,
+                                                VkDeviceSize minimum,
+                                                VkDeviceSize maximum,
+                                                uint32_t budget_divisor)
+{
+    VkDeviceSize available = transient_budget_available(r);
+    VkDeviceSize target = available ? available / budget_divisor : maximum;
+    target = MAX(minimum, MIN(target, maximum));
+    return MIN(desired, target);
+}
+
+/* The upper bounds are based on the original full-batch allocations, not
+ * on a fixed 256 MiB limit. Growth is demand-driven and can exceed that
+ * size on a GPU with enough memory. */
+static VkDeviceSize streaming_maximum(PGRAPHState *pg, int index)
+{
+    switch (index) {
+    case BUFFER_VERTEX_INLINE_STAGING:
+        return (VkDeviceSize)NV2A_VERTEXSHADER_ATTRIBUTES *
+               NV2A_MAX_BATCH_LENGTH * 4 * sizeof(float) * 10;
+    case BUFFER_INDEX_STAGING:
+        return (VkDeviceSize)sizeof(pg->inline_elements) * 100;
+    case BUFFER_UNIFORM_STAGING:
+        return 64 * XEMU_VK_MIB;
+    default:
+        return 0;
+    }
+}
+
+static int streaming_device_pair(int index)
+{
+    switch (index) {
+    case BUFFER_VERTEX_INLINE_STAGING: return BUFFER_VERTEX_INLINE;
+    case BUFFER_INDEX_STAGING: return BUFFER_INDEX;
+    case BUFFER_UNIFORM_STAGING: return BUFFER_UNIFORM;
+    default: return -1;
+    }
+}
+
 static VkDeviceSize clamp_buffer_size(PGRAPHVkState *r, VkDeviceSize desired,
                                       VkDeviceSize cap, bool storage)
 {
@@ -189,9 +265,9 @@ void pgraph_vk_init_buffers(NV2AState *d)
         .alloc_info = device_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-        .buffer_size = clamp_buffer_size(r,
-                     sizeof(pg->inline_elements) * 100,
-                     32 * XEMU_VK_MIB, false),
+        .buffer_size = initial_streaming_capacity(
+            r, (VkDeviceSize)sizeof(pg->inline_elements) * 100,
+            4 * XEMU_VK_MIB, 16 * XEMU_VK_MIB, 256),
     };
 
     r->storage_buffers[BUFFER_INDEX_STAGING] = (StorageBuffer){
@@ -213,10 +289,10 @@ void pgraph_vk_init_buffers(NV2AState *d)
         .alloc_info = device_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-        .buffer_size = clamp_buffer_size(r,
-                     (VkDeviceSize)NV2A_VERTEXSHADER_ATTRIBUTES *
-                         NV2A_MAX_BATCH_LENGTH * 4 * sizeof(float) * 10,
-                     XEMU_VK_MAX_TRANSIENT_BUFFER, false),
+        .buffer_size = initial_streaming_capacity(
+            r, (VkDeviceSize)NV2A_VERTEXSHADER_ATTRIBUTES *
+                   NV2A_MAX_BATCH_LENGTH * 4 * sizeof(float) * 10,
+            16 * XEMU_VK_MIB, 64 * XEMU_VK_MIB, 64),
     };
     r->storage_buffers[BUFFER_VERTEX_INLINE_STAGING] = (StorageBuffer){
         .alloc_info = host_alloc_create_info,
@@ -274,23 +350,151 @@ void pgraph_vk_finalize_buffers(NV2AState *d)
     g_free(r->uploaded_bitmap);
     r->uploaded_bitmap = NULL;
 }
+/* Reserve a larger *pair* only at a drained command-buffer boundary.
+ * We keep the old allocations alive until both new ones are created and the
+ * replacement staging allocation is mapped. A failure leaves the old pair
+ * intact; callers may treat an essential oversized draw as a fatal error.
+ */
+bool pgraph_vk_reserve_streaming_capacity(PGRAPHState *pg, int staging_index,
+                                          VkDeviceSize required)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    int device_index = streaming_device_pair(staging_index);
+    if (device_index < 0) {
+        return false;
+    }
+
+    StorageBuffer *host = &r->storage_buffers[staging_index];
+    StorageBuffer *device = &r->storage_buffers[device_index];
+    VkDeviceSize maximum = streaming_maximum(pg, staging_index);
+    if (required <= host->buffer_size) {
+        return true;
+    }
+    if (required > maximum || required == 0) {
+        return false;
+    }
+
+    /* A previous pgraph_vk_finish() must have submitted all draws using
+     * the old pair and reset the staging cursor. */
+    assert(!r->in_command_buffer && !r->in_aux_command_buffer);
+    assert(host->buffer_offset == 0);
+
+    VkDeviceSize next = host->buffer_size <= maximum / 2 ?
+                        host->buffer_size * 2 : maximum;
+    next = MIN(maximum, MAX(next, required));
+
+    VkDeviceSize available = transient_budget_available(r);
+    if (available) {
+        /* Treat the budget as guidance, never as a hard capacity guarantee.
+         * Leave headroom for images and other resources, especially when
+         * host-visible and device-local memory share the same heap. */
+        VkDeviceSize comfortable = available / 4;
+        next = MAX(required, MIN(next, comfortable));
+    }
+
+    while (next >= required) {
+        StorageBuffer replacement_host = *host;
+        StorageBuffer replacement_device = *device;
+        replacement_host.buffer = VK_NULL_HANDLE;
+        replacement_host.allocation = VK_NULL_HANDLE;
+        replacement_host.mapped = NULL;
+        replacement_host.buffer_offset = 0;
+        replacement_device.buffer = VK_NULL_HANDLE;
+        replacement_device.allocation = VK_NULL_HANDLE;
+        replacement_device.mapped = NULL;
+        replacement_device.buffer_offset = 0;
+
+        VkResult result = try_create_buffer(pg, &replacement_device, next);
+        if (result == VK_SUCCESS) {
+            result = try_create_buffer(pg, &replacement_host, next);
+        }
+        if (result == VK_SUCCESS) {
+            result = vmaMapMemory(r->allocator, replacement_host.allocation,
+                                  (void **)&replacement_host.mapped);
+        }
+
+        if (result == VK_SUCCESS) {
+            /* A rare full-device wait is safer than destroying a buffer
+             * referenced by an older transfer or descriptor submission. */
+            VK_CHECK(vkDeviceWaitIdle(r->device));
+            if (host->mapped) {
+                vmaUnmapMemory(r->allocator, host->allocation);
+            }
+            destroy_buffer(pg, host);
+            destroy_buffer(pg, device);
+            replacement_host.buffer_size = next;
+            replacement_device.buffer_size = next;
+            replacement_host.growth_pressure = 0;
+            *host = replacement_host;
+            *device = replacement_device;
+            fprintf(stderr,
+                    "xemu Vulkan V7: grew streaming pair %d/%d to %llu MiB\n",
+                    staging_index, device_index,
+                    (unsigned long long)(next / XEMU_VK_MIB));
+            return true;
+        }
+
+        if (replacement_host.mapped) {
+            vmaUnmapMemory(r->allocator, replacement_host.allocation);
+        }
+        if (replacement_host.buffer) {
+            destroy_buffer(pg, &replacement_host);
+        }
+        if (replacement_device.buffer) {
+            destroy_buffer(pg, &replacement_device);
+        }
+        if (!memory_allocation_failed(result) || next == required) {
+            fprintf(stderr,
+                    "xemu Vulkan V7: cannot grow pair %d/%d to %llu bytes "
+                    "(VkResult=%d)\n",
+                    staging_index, device_index,
+                    (unsigned long long)required, (int)result);
+            return false;
+        }
+        VkDeviceSize smaller = MAX(required, next / 2);
+        if (smaller == next) {
+            break;
+        }
+        next = smaller;
+    }
+    return false;
+}
+
+/* Repeated nearly-full streaming buffers indicate a workload that benefits
+ * from more space, even if no single draw exceeds the current allocation.
+ * Only the caller of this helper may decide to grow at a safe boundary. */
+bool pgraph_vk_streaming_pressure(PGRAPHState *pg, int staging_index,
+                                  VkDeviceSize used)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    if (streaming_device_pair(staging_index) < 0) {
+        return false;
+    }
+    StorageBuffer *buf = &r->storage_buffers[staging_index];
+    if (used < buf->buffer_size / 4 * 3) {
+        buf->growth_pressure = 0;
+        return false;
+    }
+    if (++buf->growth_pressure < 8) {
+        return false;
+    }
+    buf->growth_pressure = 0;
+    return true;
+}
+
 bool pgraph_vk_buffer_has_space_for(PGRAPHState *pg, int index,
                                     VkDeviceSize size,
                                     VkDeviceAddress alignment)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
     StorageBuffer *b = &r->storage_buffers[index];
-    /* A flush cannot help if one operation exceeds the entire allocation.
-     * Stop explicitly instead of issuing an out-of-range buffer copy.
-     * Growing the allocation on demand is a future improvement. */
+    /* Return false instead of aborting: the caller can drain the pending
+     * commands and enlarge an eligible host/device pair before writing. */
     if (size > b->buffer_size) {
-        fprintf(stderr,
-                "xemu Vulkan: buffer %d requires %llu bytes for one operation, "
-                "but has capacity %zu bytes\n",
-                index, (unsigned long long)size, b->buffer_size);
-        abort();
+        return false;
     }
-    return (ROUND_UP(b->buffer_offset, alignment) + size) <= b->buffer_size;
+    VkDeviceSize offset = ROUND_UP(b->buffer_offset, alignment);
+    return offset <= b->buffer_size - size;
 }
 VkDeviceSize pgraph_vk_append_to_buffer(PGRAPHState *pg, int index, void **data,
                                         VkDeviceSize *sizes, size_t count,

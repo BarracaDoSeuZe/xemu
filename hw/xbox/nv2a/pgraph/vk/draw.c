@@ -1914,11 +1914,33 @@ void pgraph_vk_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta)
 
 static bool ensure_buffer_space(PGRAPHState *pg, int index, VkDeviceSize size)
 {
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    StorageBuffer *buffer = &r->storage_buffers[index];
     if (!pgraph_vk_buffer_has_space_for(pg, index, size, 1)) {
+        VkDeviceSize used = buffer->buffer_offset;
+        bool oversized = size > buffer->buffer_size;
+        bool under_pressure = !oversized &&
+            pgraph_vk_streaming_pressure(pg, index, used);
+
+        /* Complete all draws that reference the current streaming buffers
+         * before changing any underlying VkBuffer or mapped allocation. */
         pgraph_vk_finish(pg, VK_FINISH_REASON_NEED_BUFFER_SPACE);
+        if (oversized) {
+            if (!pgraph_vk_reserve_streaming_capacity(pg, index, size)) {
+                fprintf(stderr,
+                        "xemu Vulkan V7: required streaming buffer %d cannot "
+                        "fit %llu bytes\n", index,
+                        (unsigned long long)size);
+                abort();
+            }
+        } else if (under_pressure) {
+            /* Opportunistic; allocation failure must not make an otherwise
+             * valid draw fail when the original capacity still suffices. */
+            pgraph_vk_reserve_streaming_capacity(
+                pg, index, buffer->buffer_size + 1);
+        }
         return true;
     }
-
     return false;
 }
 

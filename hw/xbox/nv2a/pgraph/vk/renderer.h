@@ -104,6 +104,7 @@ typedef struct StorageBuffer {
     size_t buffer_offset;
     size_t buffer_size;
     uint8_t *mapped;
+    unsigned int growth_pressure; /* V7 host streaming buffers only */
 } StorageBuffer;
 
 typedef struct SurfaceBinding {
@@ -477,6 +478,10 @@ void pgraph_vk_finalize_buffers(NV2AState *d);
 bool pgraph_vk_buffer_has_space_for(PGRAPHState *pg, int index,
                                     VkDeviceSize size,
                                     VkDeviceAddress alignment);
+bool pgraph_vk_reserve_streaming_capacity(PGRAPHState *pg, int staging_index,
+                                          VkDeviceSize required);
+bool pgraph_vk_streaming_pressure(PGRAPHState *pg, int staging_index,
+                                  VkDeviceSize used);
 VkDeviceSize pgraph_vk_append_to_buffer(PGRAPHState *pg, int index, void **data,
                                         VkDeviceSize *sizes, size_t count,
                                         VkDeviceAddress alignment);

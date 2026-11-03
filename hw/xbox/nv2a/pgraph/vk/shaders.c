@@ -153,15 +153,18 @@ void pgraph_vk_update_descriptor_sets(PGRAPHState *pg)
     ShaderBinding *binding = r->shader_binding;
     ShaderUniformLayout *layouts[] = { &binding->vsh.module_info->uniforms,
                                        &binding->psh.module_info->uniforms };
+    VkDeviceSize ubo_alignment =
+        r->device_props.limits.minUniformBufferOffsetAlignment;
+    /* Account for the alignment between the two uniform blocks. */
     VkDeviceSize ubo_buffer_total_size = 0;
     for (int i = 0; i < ARRAY_SIZE(layouts); i++) {
+        ubo_buffer_total_size = ROUND_UP(ubo_buffer_total_size, ubo_alignment);
         ubo_buffer_total_size += layouts[i]->total_size;
     }
     bool need_ubo_staging_buffer_reset =
         r->uniforms_changed &&
         !pgraph_vk_buffer_has_space_for(pg, BUFFER_UNIFORM_STAGING,
-                                        ubo_buffer_total_size,
-                                        r->device_props.limits.minUniformBufferOffsetAlignment);
+                                        ubo_buffer_total_size, ubo_alignment);
 
     bool need_descriptor_write_reset =
         (r->descriptor_set_index >= ARRAY_SIZE(r->descriptor_sets));
@@ -169,6 +172,16 @@ void pgraph_vk_update_descriptor_sets(PGRAPHState *pg)
     if (need_descriptor_write_reset || need_ubo_staging_buffer_reset) {
         pgraph_vk_finish(pg, VK_FINISH_REASON_NEED_BUFFER_SPACE);
         need_uniform_write = true;
+        if (need_ubo_staging_buffer_reset &&
+            !pgraph_vk_buffer_has_space_for(pg, BUFFER_UNIFORM_STAGING,
+                                            ubo_buffer_total_size,
+                                            ubo_alignment) &&
+            !pgraph_vk_reserve_streaming_capacity(
+                pg, BUFFER_UNIFORM_STAGING,
+                ubo_buffer_total_size + ubo_alignment)) {
+            fprintf(stderr, "xemu Vulkan V7: uniform buffer growth failed\n");
+            abort();
+        }
     }
 
     VkWriteDescriptorSet descriptor_writes[2 + NV2A_MAX_TEXTURES];
