@@ -1484,6 +1484,13 @@ void pgraph_vk_bind_textures(NV2AState *d)
     // FIXME: Check for modifications on bind fastpath (CPU hook)
     // FIXME: Mark textures that are sourced from surfaces so we can track them
 
+    /* Snapshot bindings before processing dirty stages.  Re-uploading a
+     * texture into the same VkImage does not change the descriptor or the
+     * pipeline's texture state.  Likewise, dirty register notifications can
+     * leave the selected cached texture object unchanged. */
+    TextureBinding *previous_bindings[NV2A_MAX_TEXTURES];
+    memcpy(previous_bindings, r->texture_bindings,
+           sizeof(previous_bindings));
     r->texture_bindings_changed = false;
 
     if (!check_textures_dirty(pg)) {
@@ -1504,7 +1511,15 @@ void pgraph_vk_bind_textures(NV2AState *d)
         pg->texture_dirty[i] = false; // FIXME: Move to renderer?
     }
 
-    r->texture_bindings_changed = true;
+    /* A dirty notification alone is not a binding change.  Avoid forcing
+     * a new pipeline-key lookup and six descriptor rewrites when every
+     * effective texture view/sampler binding is still the same. */
+    for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
+        if (previous_bindings[i] != r->texture_bindings[i]) {
+            r->texture_bindings_changed = true;
+            break;
+        }
+    }
     update_timestamps(r);
     NV2A_VK_DGROUP_END();
 }
