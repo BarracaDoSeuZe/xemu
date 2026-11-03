@@ -67,6 +67,14 @@ static TCGTBCPUState x86_get_tb_cpu_state(CPUState *cs)
     return (TCGTBCPUState){ .pc = pc, .flags = flags, .cs_base = cs_base };
 }
 
+#ifdef XBOX
+/* Direct entry point for the common indirect-branch TB lookup hot path. */
+TCGTBCPUState x86_get_tb_cpu_state_direct(CPUState *cs)
+{
+    return x86_get_tb_cpu_state(cs);
+}
+#endif
+
 static void x86_cpu_synchronize_from_tb(CPUState *cs,
                                         const TranslationBlock *tb)
 {
