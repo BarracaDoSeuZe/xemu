@@ -39,10 +39,43 @@
 
 NV2AState *g_nv2a;
 
+/*
+ * The fast path is enabled by default. Disable it before launching xemu with
+ * XEMU_FENCE_FASTPATH_DISABLE=1 to compare lock contention on the same build.
+ * A GLib once guard avoids rescanning the environment on every GPU fence poll.
+ */
+static bool pgraph_fence_fastpath_enabled(void)
+{
+    static gsize state = 0;
+
+    if (unlikely(g_once_init_enter(&state))) {
+        const char *disabled = g_getenv("XEMU_FENCE_FASTPATH_DISABLE");
+        g_once_init_leave(&state, (disabled && strcmp(disabled, "0") != 0)
+                                       ? 2 : 1);
+    }
+    return state == 1;
+}
+
 uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
     PGRAPHState *pg = &d->pgraph;
+
+    /*
+     * Xbox D3D fences are polled by the vCPU through this PGRAPH register.
+     * Taking pg->lock for every poll contends with the FIFO thread which
+     * must acquire the same lock to make progress on the fence.  A snapshot
+     * is sufficient: the actual NV2A register value is not predicted or
+     * advanced here, and the asynchronous guest still waits for the write.
+     */
+    if (addr == NV_PGRAPH_PATT_COLOR0 && size == sizeof(uint32_t) &&
+        pgraph_fence_fastpath_enabled()) {
+        uint32_t value = qatomic_read(&pg->regs_[NV_PGRAPH_PATT_COLOR0]);
+        /* Match the write barrier before the FIFO's fence publication. */
+        smp_rmb();
+        nv2a_reg_log_read(NV_PGRAPH, addr, size, value);
+        return value;
+    }
 
     qemu_mutex_lock(&pg->lock);
 
@@ -722,7 +755,9 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
     case NV_CONTEXT_PATTERN: {
         switch (method) {
         case NV044_SET_MONOCHROME_COLOR0:
-            pgraph_reg_w(pg, NV_PGRAPH_PATT_COLOR0, parameter);
+            /* Publish the fence after all earlier PGRAPH method effects. */
+            smp_wmb();
+            pgraph_reg_w_atomic(pg, NV_PGRAPH_PATT_COLOR0, parameter);
             break;
         default:
             goto unhandled;

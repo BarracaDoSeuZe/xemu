@@ -318,6 +318,21 @@ static inline void pgraph_reg_w(PGRAPHState *pg, unsigned int r, uint32_t v)
     pg->regs_[r] = v;
 }
 
+/*
+ * Like pgraph_reg_w, but publish the register with an atomic store for the
+ * lock-free PATT_COLOR0 MMIO reader.  Writers remain serialized by pg->lock,
+ * so the dirty-bit comparison and bitmap update can use the normal path.
+ */
+static inline void pgraph_reg_w_atomic(PGRAPHState *pg, unsigned int r,
+                                       uint32_t v)
+{
+    assert(r % 4 == 0);
+    if (pg->regs_[r] != v) {
+        bitmap_set(pg->regs_dirty, r / sizeof(uint32_t), 1);
+    }
+    qatomic_set(&pg->regs_[r], v);
+}
+
 void pgraph_clear_dirty_reg_map(PGRAPHState *pg);
 
 static inline bool pgraph_is_reg_dirty(PGRAPHState *pg, unsigned int reg)
