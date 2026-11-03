@@ -347,6 +347,7 @@ typedef struct PGRAPHVkState {
     uint32_t submit_count;
 
     VkCommandBuffer aux_command_buffer;
+    VkFence aux_command_buffer_fence;
     bool in_aux_command_buffer;
 
     VkFramebuffer framebuffers[50];
@@ -396,6 +397,7 @@ typedef struct PGRAPHVkState {
     TextureBinding *texture_cache_entries;
     TextureBinding *texture_bindings[NV2A_MAX_TEXTURES];
     TextureBinding dummy_texture;
+    bool native_bc_supported[3];
     bool texture_bindings_changed;
     VkFormatProperties *texture_format_properties;
 

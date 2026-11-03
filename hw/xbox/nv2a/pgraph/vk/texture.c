@@ -84,6 +84,51 @@ static enum S3TC_DECOMPRESS_FORMAT kelvin_format_to_s3tc_format(int color_format
     }
 }
 
+/* Host-side fast path only. The NV2A texture format and guest state remain
+ * unchanged. Disable with XEMU_VK_NATIVE_BC_DISABLE=1 for A/B comparisons.
+ * Start with unbordered, non-cubemap, 2D DXT resources: their blocks can be
+ * uploaded without changing the guest layout or sampling semantics. */
+static VkFormat xemu_vk_native_bc_format(PGRAPHVkState *r, TextureShape s)
+{
+    if (s.dimensionality != 2 || s.cubemap || s.border) {
+        return VK_FORMAT_UNDEFINED;
+    }
+
+    unsigned int index;
+    VkFormat format;
+    switch (s.color_format) {
+    case NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT1_A1R5G5B5:
+        index = 0;
+        format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT23_A8R8G8B8:
+        index = 1;
+        format = VK_FORMAT_BC2_UNORM_BLOCK;
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8:
+        index = 2;
+        format = VK_FORMAT_BC3_UNORM_BLOCK;
+        break;
+    default:
+        return VK_FORMAT_UNDEFINED;
+    }
+    return r->native_bc_supported[index] ? format : VK_FORMAT_UNDEFINED;
+}
+
+static VkColorFormatInfo xemu_vk_texture_host_format(PGRAPHVkState *r,
+                                                      TextureShape s,
+                                                      bool from_surface)
+{
+    VkColorFormatInfo info = kelvin_color_format_vk_map[s.color_format];
+    if (!from_surface) {
+        VkFormat native = xemu_vk_native_bc_format(r, s);
+        if (native != VK_FORMAT_UNDEFINED) {
+            info.vk_format = native;
+        }
+    }
+    return info;
+}
+
 // FIXME: Move to common
 static void memcpy_image(void *dst, void *src, int min_stride, int dst_stride, int src_stride, int height)
 {
@@ -140,6 +185,7 @@ static size_t get_cubemap_layer_size(PGRAPHState *pg, TextureShape s)
 // FIXME: Bounds checking
 static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx)
 {
+    PGRAPHVkState *r = pg->vk_renderer_state;
     NV2AState *d = container_of(pg, NV2AState, pgraph);
     TextureShape s = pgraph_get_texture_shape(pg, texture_idx);
     BasicColorFormatInfo f = kelvin_color_format_info_map[s.color_format];
@@ -221,6 +267,7 @@ static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx)
     }
 
     bool is_compressed = pgraph_is_texture_format_compressed(pg, s.color_format);
+    bool native_bc = xemu_vk_native_bc_format(r, s) != VK_FORMAT_UNDEFINED;
     size_t block_size = 0;
     if (is_compressed) {
         bool is_dxt1 =
@@ -247,10 +294,22 @@ static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx)
                     unsigned int physical_width = (width + 3) & ~3,
                                  physical_height = (height + 3) & ~3;
 
-                    size_t converted_size = width * height * 4;
-                    uint8_t *converted = s3tc_decompress_2d(
-                        kelvin_format_to_s3tc_format(s.color_format),
-                        texture_data_ptr, width, height);
+                    size_t converted_size;
+                    uint8_t *converted;
+                    if (native_bc) {
+                        /* The NV2A blocks are already laid out as linear DXT.
+                         * Keep a private copy so the existing texture-layout
+                         * cleanup and staging lifetime remain unchanged. */
+                        converted_size = (size_t)(physical_width / 4) *
+                            (physical_height / 4) * block_size;
+                        converted = g_malloc(converted_size);
+                        memcpy(converted, texture_data_ptr, converted_size);
+                    } else {
+                        converted_size = (size_t)width * height * 4;
+                        converted = s3tc_decompress_2d(
+                            kelvin_format_to_s3tc_format(s.color_format),
+                            texture_data_ptr, width, height);
+                    }
                     assert(converted);
 
                     if (s.cubemap && adjusted_width != s.width) {
@@ -480,7 +539,7 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
     TextureShape *state = &binding->key.state;
-    VkColorFormatInfo vkf = kelvin_color_format_vk_map[state->color_format];
+    VkColorFormatInfo vkf = xemu_vk_texture_host_format(r, *state, false);
 
     nv2a_profile_inc_counter(NV2A_PROF_TEX_UPLOAD);
 
@@ -542,10 +601,11 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
         }
     }
     assert(buffer_offset <= r->storage_buffers[BUFFER_STAGING_SRC].buffer_size);
-
+    /* VMA rounds non-coherent flush ranges to the device atom size.
+     * Flushing the written bytes avoids flushing the full staging buffer. */
     vmaFlushAllocation(r->allocator,
                        r->storage_buffers[BUFFER_STAGING_SRC].allocation, 0,
-                       VK_WHOLE_SIZE);
+                       buffer_offset);
 
     vmaUnmapMemory(r->allocator,
                    r->storage_buffers[BUFFER_STAGING_SRC].allocation);
@@ -1207,7 +1267,8 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     snode->possibly_dirty = false;
     snode->hash = content_hash;
 
-    VkColorFormatInfo vkf = kelvin_color_format_vk_map[state.color_format];
+    VkColorFormatInfo vkf = xemu_vk_texture_host_format(
+        r, state, surface_to_texture);
     assert(vkf.vk_format != 0);
     assert(0 < state.dimensionality);
     assert(state.dimensionality < ARRAY_SIZE(dimensionality_to_vk_image_type));
@@ -1555,7 +1616,26 @@ void pgraph_vk_init_textures(PGRAPHState *pg)
 
     texture_cache_init(r);
     create_dummy_texture(pg);
-
+    /* Query the BC formats once per Vulkan device, not on every texture
+     * cache miss. Unsupported formats retain the CPU decode fallback. */
+    static const VkFormat bc_formats[] = {
+        VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
+        VK_FORMAT_BC2_UNORM_BLOCK,
+        VK_FORMAT_BC3_UNORM_BLOCK,
+    };
+    const VkFormatFeatureFlags bc_needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    const bool bc_feature_enabled =
+        r->enabled_physical_device_features.textureCompressionBC &&
+        !g_getenv("XEMU_VK_NATIVE_BC_DISABLE");
+    for (unsigned int i = 0; i < ARRAY_SIZE(bc_formats); i++) {
+        VkFormatProperties bc_props = { 0 };
+        vkGetPhysicalDeviceFormatProperties(r->physical_device,
+                                            bc_formats[i], &bc_props);
+        r->native_bc_supported[i] = bc_feature_enabled &&
+            (bc_props.optimalTilingFeatures & bc_needed) == bc_needed;
+    }
     r->texture_format_properties = g_malloc0_n(
         ARRAY_SIZE(kelvin_color_format_vk_map), sizeof(VkFormatProperties));
     for (int i = 0; i < ARRAY_SIZE(kelvin_color_format_vk_map); i++) {

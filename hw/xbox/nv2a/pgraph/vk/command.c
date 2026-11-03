@@ -57,12 +57,19 @@ static void create_command_buffers(PGRAPHState *pg)
 
     r->command_buffer = r->command_buffers[0];
     r->aux_command_buffer = r->command_buffers[1];
+    VkFenceCreateInfo fence_info = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+    };
+    VK_CHECK(vkCreateFence(r->device, &fence_info, NULL,
+                           &r->aux_command_buffer_fence));
 }
 
 static void destroy_command_buffers(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    vkDestroyFence(r->device, r->aux_command_buffer_fence, NULL);
+    r->aux_command_buffer_fence = VK_NULL_HANDLE;
     vkFreeCommandBuffers(r->device, r->command_pool,
                          ARRAY_SIZE(r->command_buffers), r->command_buffers);
 
@@ -99,9 +106,15 @@ void pgraph_vk_end_single_time_commands(PGRAPHState *pg, VkCommandBuffer cmd)
         .commandBufferCount = 1,
         .pCommandBuffers = &cmd,
     };
-    VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info, VK_NULL_HANDLE));
+    /* Reuse of the auxiliary command buffer and the shared staging
+     * allocation still requires completion. Wait for precisely our own
+     * submission rather than idling the entire Vulkan queue. */
+    VK_CHECK(vkResetFences(r->device, 1, &r->aux_command_buffer_fence));
+    VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info,
+                           r->aux_command_buffer_fence));
     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_AUX);
-    VK_CHECK(vkQueueWaitIdle(r->queue));
+    VK_CHECK(vkWaitForFences(r->device, 1, &r->aux_command_buffer_fence,
+                             VK_TRUE, UINT64_MAX));
 
     r->in_aux_command_buffer = false;
 }

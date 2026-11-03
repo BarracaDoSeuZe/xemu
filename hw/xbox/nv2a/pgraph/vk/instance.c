@@ -560,6 +560,7 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         F(geometryShader, true),
         F(occlusionQueryPrecise, true),
         F(samplerAnisotropy, false),
+        F(textureCompressionBC, false),
         F(shaderClipDistance, true),
         F(shaderTessellationAndGeometryPointSize, true),
         F(wideLines, false),
