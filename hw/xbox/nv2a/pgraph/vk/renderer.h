@@ -95,6 +95,16 @@ enum Buffer {
     BUFFER_COUNT
 };
 
+/* Host-visible texture upload arena.  Slices remain owned by the currently
+ * recorded graphics batch until its completion fence has signaled. */
+typedef struct TextureUploadChunk TextureUploadChunk;
+typedef struct TextureUploadSlice {
+    VkBuffer buffer;
+    VmaAllocation allocation;
+    uint8_t *mapped;
+    VkDeviceSize offset;
+} TextureUploadSlice;
+
 typedef struct StorageBuffer {
     VkBuffer buffer;
     VkBufferUsageFlags usage;
@@ -341,7 +351,6 @@ typedef struct PGRAPHVkState {
     VkCommandBuffer command_buffers[2];
 
     VkCommandBuffer command_buffer;
-    VkSemaphore command_buffer_semaphore;
     VkFence command_buffer_fence;
     unsigned int command_buffer_start_time;
     bool in_command_buffer;
@@ -372,6 +381,10 @@ typedef struct PGRAPHVkState {
     int descriptor_set_index;
 
     StorageBuffer storage_buffers[BUFFER_COUNT];
+    TextureUploadChunk *texture_upload_chunks;
+    TextureUploadChunk *texture_upload_tail;
+    uint32_t texture_uploads_in_batch;
+    uint64_t texture_upload_bytes_in_batch;
 
     MemorySyncRequirement vertex_ram_buffer_syncs[NV2A_VERTEXSHADER_ATTRIBUTES];
     size_t num_vertex_ram_buffer_syncs;
@@ -474,6 +487,12 @@ void pgraph_vk_destroy_shader_module(PGRAPHVkState *r, ShaderModuleInfo *info);
 // buffer.c
 void pgraph_vk_init_buffers(NV2AState *d);
 void pgraph_vk_finalize_buffers(NV2AState *d);
+TextureUploadSlice pgraph_vk_reserve_texture_upload(PGRAPHState *pg,
+                                                     VkDeviceSize bytes);
+void pgraph_vk_flush_texture_upload(PGRAPHState *pg,
+                                    TextureUploadSlice slice,
+                                    VkDeviceSize bytes);
+void pgraph_vk_recycle_texture_uploads(PGRAPHState *pg);
 bool pgraph_vk_buffer_has_space_for(PGRAPHState *pg, int index,
                                     VkDeviceSize size,
                                     VkDeviceAddress alignment);

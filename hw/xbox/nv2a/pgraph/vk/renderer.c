@@ -69,6 +69,14 @@ static void pgraph_vk_init(NV2AState *d, Error **errp)
 static void pgraph_vk_finalize(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    /* Every mapped upload slab and Vulkan image referenced by the graphics
+     * batch must outlive its last submission, including at shutdown. */
+    if (r->in_command_buffer) {
+        pgraph_vk_finish(pg, VK_FINISH_REASON_FLUSH);
+    }
+    VK_CHECK(vkDeviceWaitIdle(r->device));
 
     pgraph_vk_finalize_display(pg);
     pgraph_vk_finalize_compute(pg);

@@ -23,6 +23,162 @@
  * buffers and their device-side counterparts are sized more conservatively.
  */
 #define XEMU_VK_MIB ((VkDeviceSize)1024 * 1024)
+
+
+/* Texture uploads share the graphics command stream instead of requiring one
+ * GPU submission and host wait per texture.  A persistent, mapped slab arena
+ * gives each pending copy a non-overlapping source region.  Reuse is legal
+ * only after pgraph_vk_finish() has waited on the batch completion fence.
+ *
+ * These buffers are host resources, not the emulated Xbox VRAM. */
+struct TextureUploadChunk {
+    struct TextureUploadChunk *next;
+    VkBuffer buffer;
+    VmaAllocation allocation;
+    uint8_t *mapped;
+    VkDeviceSize size;
+    VkDeviceSize used;
+};
+
+/* 1 MiB chunks avoid a large upfront reservation on an iGPU. */
+#define XEMU_VK_UPLOAD_SLAB (1 * XEMU_VK_MIB)
+#define XEMU_VK_UPLOAD_RETAIN_LIMIT (32 * XEMU_VK_MIB)
+
+static VkDeviceSize texture_upload_alignment(PGRAPHVkState *r)
+{
+    /* A VkBufferImageCopy offset must satisfy compressed block alignment
+     * (up to 16 bytes), and flushes must not share non-coherent atoms. */
+    return MAX((VkDeviceSize)16,
+               r->device_props.limits.nonCoherentAtomSize);
+}
+
+static TextureUploadChunk *create_texture_upload_chunk(PGRAPHVkState *r,
+                                                        VkDeviceSize minimum)
+{
+    VkDeviceSize slab = XEMU_VK_UPLOAD_SLAB;
+    VkDeviceSize align = texture_upload_alignment(r);
+    VkDeviceSize size = ROUND_UP(MAX(slab, minimum), align);
+    TextureUploadChunk *chunk = g_new0(TextureUploadChunk, 1);
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VmaAllocationCreateInfo alloc_info = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                 VMA_ALLOCATION_CREATE_MAPPED_BIT,
+    };
+    VmaAllocationInfo info = { 0 };
+    VkResult result = vmaCreateBuffer(r->allocator, &buffer_info, &alloc_info,
+                                      &chunk->buffer, &chunk->allocation, &info);
+    VK_CHECK(result);
+    assert(info.pMappedData != NULL);
+    chunk->mapped = info.pMappedData;
+    chunk->size = size;
+    if (r->texture_upload_tail) {
+        r->texture_upload_tail->next = chunk;
+    } else {
+        r->texture_upload_chunks = chunk;
+    }
+    r->texture_upload_tail = chunk;
+    return chunk;
+}
+
+TextureUploadSlice pgraph_vk_reserve_texture_upload(PGRAPHState *pg,
+                                                     VkDeviceSize bytes)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    assert(bytes > 0);
+    VkDeviceSize alignment = texture_upload_alignment(r);
+    TextureUploadChunk *chunk = r->texture_upload_chunks;
+    VkDeviceSize pos = 0;
+    while (chunk) {
+        pos = ROUND_UP(chunk->used, alignment);
+        if (pos <= chunk->size && bytes <= chunk->size - pos) {
+            break;
+        }
+        chunk = chunk->next;
+    }
+    if (!chunk) {
+        chunk = create_texture_upload_chunk(r, bytes);
+        pos = 0;
+    }
+    chunk->used = pos + bytes;
+    assert(pos % alignment == 0);
+    assert(chunk->used <= chunk->size);
+    r->texture_uploads_in_batch++;
+    r->texture_upload_bytes_in_batch += bytes;
+    return (TextureUploadSlice){
+        .buffer = chunk->buffer,
+        .allocation = chunk->allocation,
+        .mapped = chunk->mapped + pos,
+        .offset = pos,
+    };
+}
+
+void pgraph_vk_flush_texture_upload(PGRAPHState *pg,
+                                    TextureUploadSlice slice,
+                                    VkDeviceSize bytes)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    VK_CHECK(vmaFlushAllocation(r->allocator, slice.allocation, slice.offset,
+                                bytes));
+}
+
+/* This function must only run AFTER the graphics submission fence signals.
+ * Keep at most 32 MiB for reuse on iGPUs; release the excess only when
+ * nothing can still access it. */
+void pgraph_vk_recycle_texture_uploads(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    /* Opt-in diagnostics.  Never emit per-frame logs on the normal path. */
+    static int report_uploads = -1;
+    if (report_uploads < 0) {
+        const char *env = getenv("XEMU_VK_UPLOAD_STATS");
+        report_uploads = env && strcmp(env, "1") == 0;
+    }
+    if (report_uploads && r->texture_uploads_in_batch) {
+        fprintf(stderr,
+                "xemu/vk: batched %u texture uploads (%llu KiB), submit %u\n",
+                r->texture_uploads_in_batch,
+                (unsigned long long)(r->texture_upload_bytes_in_batch / 1024),
+                r->submit_count);
+    }
+    TextureUploadChunk **link = &r->texture_upload_chunks;
+    TextureUploadChunk *last = NULL;
+    VkDeviceSize retained = 0;
+    while (*link) {
+        TextureUploadChunk *chunk = *link;
+        if (retained && chunk->size > XEMU_VK_UPLOAD_RETAIN_LIMIT -
+                                        MIN(retained, XEMU_VK_UPLOAD_RETAIN_LIMIT)) {
+            *link = chunk->next;
+            vmaDestroyBuffer(r->allocator, chunk->buffer, chunk->allocation);
+            g_free(chunk);
+            continue;
+        }
+        chunk->used = 0;
+        retained += chunk->size;
+        last = chunk;
+        link = &chunk->next;
+    }
+    r->texture_upload_tail = last;
+    r->texture_uploads_in_batch = 0;
+    r->texture_upload_bytes_in_batch = 0;
+}
+
+static void destroy_texture_upload_arena(PGRAPHVkState *r)
+{
+    TextureUploadChunk *chunk = r->texture_upload_chunks;
+    while (chunk) {
+        TextureUploadChunk *next = chunk->next;
+        vmaDestroyBuffer(r->allocator, chunk->buffer, chunk->allocation);
+        g_free(chunk);
+        chunk = next;
+    }
+    r->texture_upload_chunks = r->texture_upload_tail = NULL;
+}
 #define XEMU_VK_MAX_TRANSIENT_BUFFER (256 * XEMU_VK_MIB)
 
 /* V7: Keep the guest-visible NV2A limits unchanged. Only the host Vulkan
@@ -323,6 +479,8 @@ void pgraph_vk_init_buffers(NV2AState *d)
                        BUFFER_VERTEX_INLINE_STAGING);
     create_buffer_pair(pg, BUFFER_COMPUTE_DST, BUFFER_COMPUTE_SRC);
 
+    fprintf(stderr, "xemu/vk: batched texture staging enabled (1 MiB slabs)\n");
+
     // FIXME: Add fallback path for device using host mapped memory
 
     int buffers_to_map[] = { BUFFER_VERTEX_RAM,
@@ -340,6 +498,10 @@ void pgraph_vk_finalize_buffers(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHVkState *r = pg->vk_renderer_state;
+    /* The renderer must drain its graphics queue before destroying these
+     * persistently mapped upload slabs. */
+    assert(!r->in_command_buffer && !r->in_aux_command_buffer);
+    destroy_texture_upload_arena(r);
     for (int i = 0; i < BUFFER_COUNT; i++) {
         if (r->storage_buffers[i].mapped) {
             vmaUnmapMemory(r->allocator, r->storage_buffers[i].allocation);

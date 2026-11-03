@@ -557,15 +557,11 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
         }
     }
 
-    assert(texture_data_size <=
-           r->storage_buffers[BUFFER_STAGING_SRC].buffer_size);
-
-    // Copy texture data to mapped device buffer
-    uint8_t *mapped_memory_ptr;
-
-    VK_CHECK(vmaMapMemory(r->allocator,
-                          r->storage_buffers[BUFFER_STAGING_SRC].allocation,
-                          (void *)&mapped_memory_ptr));
+    /* Every pending upload owns a distinct staging slice in this batch.
+     * No texture upload performs a vkQueueSubmit or waits on a GPU fence. */
+    TextureUploadSlice slice = pgraph_vk_reserve_texture_upload(
+        pg, texture_data_size);
+    uint8_t *mapped_memory_ptr = slice.mapped;
 
     int num_regions = num_layers * state->levels;
     g_autofree VkBufferImageCopy *regions =
@@ -585,7 +581,7 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
             memcpy(mapped_memory_ptr + buffer_offset, level->decoded_data,
                    level->decoded_size);
             *region = (VkBufferImageCopy){
-                .bufferOffset = buffer_offset,
+                .bufferOffset = slice.offset + buffer_offset,
                 .bufferRowLength = 0, // Tightly packed
                 .bufferImageHeight = 0,
                 .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -600,50 +596,35 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
             region++;
         }
     }
-    assert(buffer_offset <= r->storage_buffers[BUFFER_STAGING_SRC].buffer_size);
-    /* VMA rounds non-coherent flush ranges to the device atom size.
-     * Flushing the written bytes avoids flushing the full staging buffer. */
-    vmaFlushAllocation(r->allocator,
-                       r->storage_buffers[BUFFER_STAGING_SRC].allocation, 0,
-                       buffer_offset);
+    assert(buffer_offset == texture_data_size);
+    pgraph_vk_flush_texture_upload(pg, slice, buffer_offset);
 
-    vmaUnmapMemory(r->allocator,
-                   r->storage_buffers[BUFFER_STAGING_SRC].allocation);
-
-    // FIXME: Use nondraw. Need to fill and copy tex buffer at once
-    VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
+    /* Record the transfer at its true point in draw order.  Ending the
+     * current render pass here protects read-after-write dependencies. */
+    VkCommandBuffer cmd = pgraph_vk_begin_nondraw_commands(pg);
     pgraph_vk_begin_debug_marker(r, cmd, RGBA_GREEN, __func__);
 
-    VkBufferMemoryBarrier host_barrier = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = r->storage_buffers[BUFFER_STAGING_SRC].buffer,
-        .size = VK_WHOLE_SIZE
-    };
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1,
-                         &host_barrier, 0, NULL);
+    /* vmaFlushAllocation() makes non-coherent host writes available.
+     * Vulkan queue submission guarantees host writes preceding vkQueueSubmit
+     * are visible to the transfer commands, so no per-texture HOST->TRANSFER
+     * pipeline barrier is necessary here.  The image barriers below still
+     * establish TRANSFER_WRITE -> SHADER_READ dependencies. */
 
     pgraph_vk_transition_image_layout(pg, cmd, binding->image, vkf.vk_format,
                                       binding->current_layout,
                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     binding->current_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 
-    vkCmdCopyBufferToImage(cmd, r->storage_buffers[BUFFER_STAGING_SRC].buffer,
-                           binding->image, binding->current_layout,
-                           num_regions, regions);
+    vkCmdCopyBufferToImage(cmd, slice.buffer, binding->image,
+                           binding->current_layout, num_regions, regions);
 
     pgraph_vk_transition_image_layout(pg, cmd, binding->image, vkf.vk_format,
                                       binding->current_layout,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     binding->current_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_4);
     pgraph_vk_end_debug_marker(r, cmd);
-    pgraph_vk_end_single_time_commands(pg, cmd);
+    pgraph_vk_end_nondraw_commands(pg, cmd);
 
     // Release decoded texture data
     for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {

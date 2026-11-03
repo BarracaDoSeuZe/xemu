@@ -266,12 +266,6 @@ void pgraph_vk_init_pipelines(PGRAPHState *pg)
     init_clear_shaders(pg);
     init_render_passes(r);
 
-    VkSemaphoreCreateInfo semaphore_info = {
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
-    };
-    VK_CHECK(vkCreateSemaphore(r->device, &semaphore_info, NULL,
-                               &r->command_buffer_semaphore));
-
     VkFenceCreateInfo fence_info = {
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
     };
@@ -288,7 +282,6 @@ void pgraph_vk_finalize_pipelines(PGRAPHState *pg)
     finalize_render_passes(r);
 
     vkDestroyFence(r->device, r->command_buffer_fence, NULL);
-    vkDestroySemaphore(r->device, r->command_buffer_semaphore, NULL);
 }
 
 static void init_render_pass_state(PGRAPHState *pg, RenderPassState *state)
@@ -1295,28 +1288,23 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
         VK_CHECK(vkEndCommandBuffer(r->aux_command_buffer));
         r->in_aux_command_buffer = false;
 
-        VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-        VkSubmitInfo submit_infos[] = {
-            {
-                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                .commandBufferCount = 1,
-                .pCommandBuffers = &r->aux_command_buffer,
-                .signalSemaphoreCount = 1,
-                .pSignalSemaphores = &r->command_buffer_semaphore,
-            },
-            {
-
-                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                .commandBufferCount = 1,
-                .pCommandBuffers = &r->command_buffer,
-                .waitSemaphoreCount = 1,
-                .pWaitSemaphores = &r->command_buffer_semaphore,
-                .pWaitDstStageMask = &wait_stage,
-            }
+        /* Submit both command buffers as one ordered batch on the same
+         * Vulkan queue.  The transfer->vertex/uniform pipeline barriers
+         * recorded in the prelude cover later drawing commands as well;
+         * a binary semaphore between two submissions to this *same* queue
+         * added driver overhead without a separate cross-queue dependency. */
+        VkCommandBuffer ordered_commands[] = {
+            r->aux_command_buffer,
+            r->command_buffer,
+        };
+        VkSubmitInfo submit_info = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = ARRAY_SIZE(ordered_commands),
+            .pCommandBuffers = ordered_commands,
         };
         nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT);
-        vkResetFences(r->device, 1, &r->command_buffer_fence);
-        VK_CHECK(vkQueueSubmit(r->queue, ARRAY_SIZE(submit_infos), submit_infos,
+        VK_CHECK(vkResetFences(r->device, 1, &r->command_buffer_fence));
+        VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info,
                                r->command_buffer_fence));
         r->submit_count += 1;
 
@@ -1337,6 +1325,9 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
         VK_CHECK(vkWaitForFences(r->device, 1, &r->command_buffer_fence,
                                  VK_TRUE, UINT64_MAX));
 
+        /* The submitted graphics batch has finished; its texture staging
+         * slices can safely be reused by the next batch. */
+        pgraph_vk_recycle_texture_uploads(pg);
         r->descriptor_set_index = 0;
         r->in_command_buffer = false;
 
