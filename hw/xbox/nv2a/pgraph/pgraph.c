@@ -2675,11 +2675,46 @@ DEF_METHOD(NV097, DRAW_ARRAYS)
     pg->draw_arrays_prevent_connect = false;
 }
 
-DEF_METHOD_NON_INC(NV097, INLINE_ARRAY)
+/* Dispatch the contiguous, non-incrementing INLINE_ARRAY payload as one
+ * batch.  This removes the per-word method-wrapper overhead without changing
+ * the vertex words or their ordering.  Incrementing packets retain the old
+ * single-word behavior.
+ *
+ * Keep individual trace events when method tracing is enabled; normal builds
+ * bypass the expensive trace/log dispatch for every extra vertex word.
+ */
+DEF_METHOD(NV097, INLINE_ARRAY)
 {
     pgraph_check_within_begin_end_block(pg);
     assert(pg->inline_array_length < NV2A_MAX_BATCH_LENGTH);
-    pg->inline_array[pg->inline_array_length++] = parameter;
+
+    if (inc) {
+        pg->inline_array[pg->inline_array_length++] = parameter;
+        return;
+    }
+
+    size_t remaining = (size_t)NV2A_MAX_BATCH_LENGTH -
+                       (size_t)pg->inline_array_length;
+    size_t count = MIN(num_words_available, remaining);
+
+    if (unlikely(trace_event_get_state_backends(TRACE_NV2A_PGRAPH_METHOD))) {
+        for (size_t i = 0; i < count; i++) {
+            uint32_t word = ldl_le_p(parameters + i);
+            if (i) {
+                pgraph_method_log(subchannel, NV_KELVIN_PRIMITIVE, method,
+                                  word);
+            }
+            pg->inline_array[pg->inline_array_length + i] = word;
+        }
+    } else {
+        for (size_t i = 0; i < count; i++) {
+            pg->inline_array[pg->inline_array_length + i] =
+                ldl_le_p(parameters + i);
+        }
+    }
+
+    pg->inline_array_length += count;
+    *num_words_consumed = count;
 }
 
 DEF_METHOD_INC(NV097, SET_EYE_VECTOR)
