@@ -9,6 +9,7 @@
 
 #include <glib.h>
 #include <glib/gstdio.h>
+#include "ui/xemu-settings.h"
 #include <vulkan/vulkan.h>
 #include <stdint.h>
 #include <string.h>
@@ -21,7 +22,10 @@
 static inline gboolean xemu_vk_disk_cache_enabled(void)
 {
     const char *env = g_getenv("XEMU_VK_DISK_CACHE_DISABLE");
-    return !(env && strcmp(env, "1") == 0);
+    /* Share OpenGL's "Cache shaders to disk" setting. Keep the env override
+     * for debugging or clearing the cache without changing user settings. */
+    return g_config.perf.cache_shaders &&
+           !(env && strcmp(env, "1") == 0);
 }
 
 static inline char *xemu_vk_disk_cache_path(const char *subdir,
@@ -30,8 +34,15 @@ static inline char *xemu_vk_disk_cache_path(const char *subdir,
     if (!xemu_vk_disk_cache_enabled()) {
         return NULL;
     }
-    char *dir = g_build_filename(g_get_user_cache_dir(), "xemu",
-                                 "nv2a-vulkan-cache-v1", subdir, NULL);
+    /* Follow the OpenGL backend: store shaders next to xemu.toml under
+     * xemu_settings_get_base_path()/shaders. Vulkan has its own versioned
+     * subtree so neither backend can mistake the other's files for its own. */
+    const char *base_dir = xemu_settings_get_base_path();
+    if (!base_dir || !*base_dir) {
+        return NULL;
+    }
+    char *dir = g_build_filename(base_dir, "shaders", "vulkan", "v1",
+                                 subdir, NULL);
     if (!dir) {
         return NULL;
     }
@@ -64,8 +75,16 @@ static inline char *xemu_vk_spv_cache_path(const VkPhysicalDeviceProperties *p,
         p->vendorID, p->deviceID, p->driverVersion);
     g_checksum_update(sum, (const guchar *)options, strlen(options));
     g_checksum_update(sum, (const guchar *)glsl, strlen(glsl));
-    char *name = g_strdup_printf("%s.spvbin", g_checksum_get_string(sum));
-    char *path = xemu_vk_disk_cache_path("spirv", name);
+    /* Just like the OpenGL shader cache, shard files by a hash prefix
+     * rather than placing thousands of shaders in a single directory. */
+    const char *hash = g_checksum_get_string(sum);
+    char prefix[5];
+    memcpy(prefix, hash, 4);
+    prefix[4] = '\0';
+    char *subdir = g_build_filename("spirv", prefix, NULL);
+    char *name = g_strdup_printf("%s.spvbin", hash);
+    char *path = xemu_vk_disk_cache_path(subdir, name);
+    g_free(subdir);
     g_free(name);
     g_free(options);
     g_checksum_free(sum);
