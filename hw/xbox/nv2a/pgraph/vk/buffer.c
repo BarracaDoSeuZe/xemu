@@ -492,6 +492,81 @@ void pgraph_vk_init_buffers(NV2AState *d)
             r->allocator, r->storage_buffers[buffers_to_map[i]].allocation,
             (void **)&r->storage_buffers[buffers_to_map[i]].mapped));
     }
+    pgraph_vk_init_batch_stream_buffers(d);
+}
+
+static const int batch_stream_indices[] = {
+    BUFFER_INDEX, BUFFER_INDEX_STAGING,
+    BUFFER_VERTEX_INLINE, BUFFER_VERTEX_INLINE_STAGING,
+    BUFFER_UNIFORM, BUFFER_UNIFORM_STAGING,
+};
+
+static bool batch_stream_index(int index)
+{
+    for (unsigned int i = 0; i < ARRAY_SIZE(batch_stream_indices); i++) {
+        if (batch_stream_indices[i] == index) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void pgraph_vk_init_batch_stream_buffers(NV2AState *d)
+{
+    PGRAPHState *pg = &d->pgraph;
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    StorageBuffer baseline[ARRAY_SIZE(batch_stream_indices)];
+
+    for (unsigned int j = 0; j < ARRAY_SIZE(batch_stream_indices); j++) {
+        int idx = batch_stream_indices[j];
+        baseline[j] = r->storage_buffers[idx];
+        r->batches[0].stream_buffers[idx] = baseline[j];
+    }
+    for (unsigned int slot = 0; slot < XEMU_VK_BATCH_COUNT; slot++) {
+        r->batches[slot].vertex_pages = bitmap_new(r->bitmap_size);
+        bitmap_clear(r->batches[slot].vertex_pages, 0, r->bitmap_size);
+    }
+
+    /* Reserve less memory for the initially idle second frame. The V7
+     * allocator grows each pair on demand once that slot is retired. */
+    for (unsigned int slot = 1; slot < XEMU_VK_BATCH_COUNT; slot++) {
+        for (unsigned int j = 0; j < ARRAY_SIZE(batch_stream_indices); j++) {
+            StorageBuffer clone = baseline[j];
+            clone.buffer = VK_NULL_HANDLE;
+            clone.allocation = VK_NULL_HANDLE;
+            clone.mapped = NULL;
+            clone.buffer_offset = 0;
+            clone.growth_pressure = 0;
+            VkDeviceSize cap =
+                batch_stream_indices[j] == BUFFER_VERTEX_INLINE ||
+                batch_stream_indices[j] == BUFFER_VERTEX_INLINE_STAGING ?
+                    16 * XEMU_VK_MIB :
+                batch_stream_indices[j] == BUFFER_INDEX ||
+                batch_stream_indices[j] == BUFFER_INDEX_STAGING ?
+                    4 * XEMU_VK_MIB : 8 * XEMU_VK_MIB;
+            clone.buffer_size = MIN(clone.buffer_size, cap);
+            r->storage_buffers[batch_stream_indices[j]] = clone;
+        }
+        create_buffer_pair(pg, BUFFER_INDEX, BUFFER_INDEX_STAGING);
+        create_buffer_pair(pg, BUFFER_VERTEX_INLINE,
+                           BUFFER_VERTEX_INLINE_STAGING);
+        create_buffer_pair(pg, BUFFER_UNIFORM, BUFFER_UNIFORM_STAGING);
+        int host_indices[] = { BUFFER_INDEX_STAGING,
+                               BUFFER_VERTEX_INLINE_STAGING,
+                               BUFFER_UNIFORM_STAGING };
+        for (unsigned int j = 0; j < ARRAY_SIZE(host_indices); j++) {
+            StorageBuffer *host = &r->storage_buffers[host_indices[j]];
+            VK_CHECK(vmaMapMemory(r->allocator, host->allocation,
+                                  (void **)&host->mapped));
+        }
+        for (unsigned int j = 0; j < ARRAY_SIZE(batch_stream_indices); j++) {
+            int idx = batch_stream_indices[j];
+            r->batches[slot].stream_buffers[idx] = r->storage_buffers[idx];
+            r->storage_buffers[idx] = baseline[j];
+        }
+    }
+    fprintf(stderr, "xemu/vk: 2 Vulkan graphics batches available "
+                    "(separate streaming resources)\n");
 }
 
 void pgraph_vk_finalize_buffers(NV2AState *d)
@@ -501,14 +576,33 @@ void pgraph_vk_finalize_buffers(NV2AState *d)
     /* The renderer must drain its graphics queue before destroying these
      * persistently mapped upload slabs. */
     assert(!r->in_command_buffer && !r->in_aux_command_buffer);
-    destroy_texture_upload_arena(r);
+    pgraph_vk_save_batch_state(r);
+    for (unsigned int slot = 0; slot < XEMU_VK_BATCH_COUNT; slot++) {
+        VkGraphicsBatchSlot *batch = &r->batches[slot];
+        r->texture_upload_chunks = batch->upload_chunks;
+        r->texture_upload_tail = batch->upload_tail;
+        destroy_texture_upload_arena(r);
+        for (unsigned int j = 0; j < ARRAY_SIZE(batch_stream_indices); j++) {
+            StorageBuffer *buf =
+                &batch->stream_buffers[batch_stream_indices[j]];
+            if (buf->mapped) {
+                vmaUnmapMemory(r->allocator, buf->allocation);
+            }
+            destroy_buffer(pg, buf);
+        }
+        g_free(batch->vertex_pages);
+        batch->vertex_pages = NULL;
+    }
     for (int i = 0; i < BUFFER_COUNT; i++) {
+        if (batch_stream_index(i)) {
+            continue;
+        }
         if (r->storage_buffers[i].mapped) {
             vmaUnmapMemory(r->allocator, r->storage_buffers[i].allocation);
         }
         destroy_buffer(pg, &r->storage_buffers[i]);
     }
-
+    r->texture_upload_chunks = r->texture_upload_tail = NULL;
     g_free(r->uploaded_bitmap);
     r->uploaded_bitmap = NULL;
 }

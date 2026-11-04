@@ -32,7 +32,7 @@ static void create_descriptor_pool(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
-    size_t num_sets = ARRAY_SIZE(r->descriptor_sets);
+    size_t num_sets = XEMU_VK_BATCH_COUNT * XEMU_VK_DESCRIPTOR_SETS_PER_BATCH;
 
     VkDescriptorPoolSize pool_sizes[] = {
         {
@@ -49,7 +49,7 @@ static void create_descriptor_pool(PGRAPHState *pg)
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .poolSizeCount = ARRAY_SIZE(pool_sizes),
         .pPoolSizes = pool_sizes,
-        .maxSets = ARRAY_SIZE(r->descriptor_sets),
+        .maxSets = num_sets,
         .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
     };
     VK_CHECK(vkCreateDescriptorPool(r->device, &pool_info, NULL,
@@ -111,7 +111,8 @@ static void create_descriptor_sets(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
-    VkDescriptorSetLayout layouts[ARRAY_SIZE(r->descriptor_sets)];
+    VkDescriptorSetLayout layouts[XEMU_VK_BATCH_COUNT *
+                                  XEMU_VK_DESCRIPTOR_SETS_PER_BATCH];
     for (int i = 0; i < ARRAY_SIZE(layouts); i++) {
         layouts[i] = r->descriptor_set_layout;
     }
@@ -119,11 +120,11 @@ static void create_descriptor_sets(PGRAPHState *pg)
     VkDescriptorSetAllocateInfo alloc_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = r->descriptor_pool,
-        .descriptorSetCount = ARRAY_SIZE(r->descriptor_sets),
+        .descriptorSetCount = ARRAY_SIZE(layouts),
         .pSetLayouts = layouts,
     };
-    VK_CHECK(
-        vkAllocateDescriptorSets(r->device, &alloc_info, r->descriptor_sets));
+    VK_CHECK(vkAllocateDescriptorSets(r->device, &alloc_info,
+                                      &r->descriptor_sets[0][0]));
 }
 
 static void destroy_descriptor_sets(PGRAPHState *pg)
@@ -131,10 +132,9 @@ static void destroy_descriptor_sets(PGRAPHState *pg)
     PGRAPHVkState *r = pg->vk_renderer_state;
 
     vkFreeDescriptorSets(r->device, r->descriptor_pool,
-                         ARRAY_SIZE(r->descriptor_sets), r->descriptor_sets);
-    for (int i = 0; i < ARRAY_SIZE(r->descriptor_sets); i++) {
-        r->descriptor_sets[i] = VK_NULL_HANDLE;
-    }
+                         XEMU_VK_BATCH_COUNT * XEMU_VK_DESCRIPTOR_SETS_PER_BATCH,
+                         &r->descriptor_sets[0][0]);
+    memset(r->descriptor_sets, 0, sizeof(r->descriptor_sets));
 }
 
 void pgraph_vk_update_descriptor_sets(PGRAPHState *pg)
@@ -167,7 +167,7 @@ void pgraph_vk_update_descriptor_sets(PGRAPHState *pg)
                                         ubo_buffer_total_size, ubo_alignment);
 
     bool need_descriptor_write_reset =
-        (r->descriptor_set_index >= ARRAY_SIZE(r->descriptor_sets));
+        (r->descriptor_set_index >= XEMU_VK_DESCRIPTOR_SETS_PER_BATCH);
 
     if (need_descriptor_write_reset || need_ubo_staging_buffer_reset) {
         pgraph_vk_finish(pg, VK_FINISH_REASON_NEED_BUFFER_SPACE);
@@ -186,7 +186,7 @@ void pgraph_vk_update_descriptor_sets(PGRAPHState *pg)
 
     VkWriteDescriptorSet descriptor_writes[2 + NV2A_MAX_TEXTURES];
 
-    assert(r->descriptor_set_index < ARRAY_SIZE(r->descriptor_sets));
+    assert(r->descriptor_set_index < XEMU_VK_DESCRIPTOR_SETS_PER_BATCH);
 
     if (need_uniform_write) {
         for (int i = 0; i < ARRAY_SIZE(layouts); i++) {
@@ -209,7 +209,7 @@ void pgraph_vk_update_descriptor_sets(PGRAPHState *pg)
         };
         descriptor_writes[i] = (VkWriteDescriptorSet){
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = r->descriptor_sets[r->descriptor_set_index],
+            .dstSet = r->descriptor_sets[r->active_batch][r->descriptor_set_index],
             .dstBinding = i == 0 ? VSH_UBO_BINDING : PSH_UBO_BINDING,
             .dstArrayElement = 0,
             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -227,7 +227,7 @@ void pgraph_vk_update_descriptor_sets(PGRAPHState *pg)
         };
         descriptor_writes[2 + i] = (VkWriteDescriptorSet){
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = r->descriptor_sets[r->descriptor_set_index],
+            .dstSet = r->descriptor_sets[r->active_batch][r->descriptor_set_index],
             .dstBinding = PSH_TEX_BINDING + i,
             .dstArrayElement = 0,
             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,

@@ -60,6 +60,7 @@ void pgraph_vk_update_vertex_ram_buffer(PGRAPHState *pg, hwaddr offset,
         pgraph_vk_finish(pg, VK_FINISH_REASON_VERTEX_BUFFER_DIRTY);
     }
 
+    pgraph_vk_wait_vertex_writes(r, offset, size);
     nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_1);
     memcpy(r->storage_buffers[BUFFER_VERTEX_RAM].mapped + offset, data, size);
 
@@ -75,6 +76,7 @@ static void update_memory_buffer(NV2AState *d, hwaddr addr, hwaddr size)
            ARRAY_SIZE(r->vertex_ram_buffer_syncs));
     r->vertex_ram_buffer_syncs[r->num_vertex_ram_buffer_syncs++] =
         (MemorySyncRequirement){ .addr = addr, .size = size };
+    pgraph_vk_mark_vertex_pages(r, addr, size);
 }
 
 static const VkFormat float_to_count[] = {

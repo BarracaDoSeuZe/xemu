@@ -55,8 +55,12 @@ static void create_command_buffers(PGRAPHState *pg)
     VK_CHECK(
         vkAllocateCommandBuffers(r->device, &alloc_info, r->command_buffers));
 
-    r->command_buffer = r->command_buffers[0];
-    r->aux_command_buffer = r->command_buffers[1];
+    for (unsigned int i = 0; i < XEMU_VK_BATCH_COUNT; ++i) {
+        r->batches[i].draw_cmd = r->command_buffers[2 * i];
+        r->batches[i].prelude_cmd = r->command_buffers[2 * i + 1];
+    }
+    r->command_buffer = r->batches[0].draw_cmd;
+    r->aux_command_buffer = r->batches[0].prelude_cmd;
     VkFenceCreateInfo fence_info = {
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
     };
@@ -82,6 +86,11 @@ VkCommandBuffer pgraph_vk_begin_single_time_commands(PGRAPHState *pg)
     PGRAPHVkState *r = pg->vk_renderer_state;
 
     assert(!r->in_aux_command_buffer);
+    /* Standalone transfers may use shared compute/surface staging and Vulkan
+     * images, unlike the dedicated per-batch draw prelude. */
+    if (!r->recording_batch_prelude) {
+        pgraph_vk_wait_graphics_batches(r);
+    }
     r->in_aux_command_buffer = true;
 
     VkCommandBufferBeginInfo begin_info = {

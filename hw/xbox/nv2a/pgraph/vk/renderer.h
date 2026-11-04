@@ -117,6 +117,31 @@ typedef struct StorageBuffer {
     unsigned int growth_pressure; /* V7 host streaming buffers only */
 } StorageBuffer;
 
+#define XEMU_VK_BATCH_COUNT 2
+#define XEMU_VK_DESCRIPTOR_SETS_PER_BATCH 1024
+#define XEMU_VK_FRAMEBUFFERS_PER_BATCH 50
+
+typedef struct VkGraphicsBatchSlot {
+    VkCommandBuffer draw_cmd;
+    VkCommandBuffer prelude_cmd;
+    VkFence fence;
+    bool submitted; /* Resources are retained until retired. */
+    bool pending;   /* GPU fence has not yet been waited on. */
+
+    StorageBuffer stream_buffers[BUFFER_COUNT];
+    VkFramebuffer framebuffers[XEMU_VK_FRAMEBUFFERS_PER_BATCH];
+    int framebuffer_index;
+    int descriptor_set_index;
+
+    TextureUploadChunk *upload_chunks;
+    TextureUploadChunk *upload_tail;
+    uint32_t upload_count;
+    uint64_t upload_bytes;
+
+    /* Pages read through the shared 64MiB vertex-RAM buffer. */
+    unsigned long *vertex_pages;
+} VkGraphicsBatchSlot;
+
 typedef struct SurfaceBinding {
     QTAILQ_ENTRY(SurfaceBinding) entry;
     MemAccessCallback *access_cb;
@@ -348,19 +373,24 @@ typedef struct PGRAPHVkState {
 
     VkQueue queue;
     VkCommandPool command_pool;
-    VkCommandBuffer command_buffers[2];
+    VkCommandBuffer command_buffers[2 * XEMU_VK_BATCH_COUNT];
 
     VkCommandBuffer command_buffer;
     VkFence command_buffer_fence;
     unsigned int command_buffer_start_time;
     bool in_command_buffer;
     uint32_t submit_count;
+    VkGraphicsBatchSlot batches[XEMU_VK_BATCH_COUNT];
+    unsigned int active_batch;
+    bool recording_batch_prelude;
+    uint64_t deferred_batch_submits;
+    uint64_t batch_slot_waits;
 
     VkCommandBuffer aux_command_buffer;
     VkFence aux_command_buffer_fence;
     bool in_aux_command_buffer;
 
-    VkFramebuffer framebuffers[50];
+    VkFramebuffer framebuffers[XEMU_VK_FRAMEBUFFERS_PER_BATCH];
     int framebuffer_index;
     bool framebuffer_dirty;
 
@@ -377,7 +407,8 @@ typedef struct PGRAPHVkState {
 
     VkDescriptorPool descriptor_pool;
     VkDescriptorSetLayout descriptor_set_layout;
-    VkDescriptorSet descriptor_sets[1024];
+    VkDescriptorSet descriptor_sets[XEMU_VK_BATCH_COUNT]
+                                    [XEMU_VK_DESCRIPTOR_SETS_PER_BATCH];
     int descriptor_set_index;
 
     StorageBuffer storage_buffers[BUFFER_COUNT];
@@ -484,7 +515,16 @@ void pgraph_vk_ref_shader_module(ShaderModuleInfo *info);
 void pgraph_vk_unref_shader_module(PGRAPHVkState *r, ShaderModuleInfo *info);
 void pgraph_vk_destroy_shader_module(PGRAPHVkState *r, ShaderModuleInfo *info);
 
+/* The ring records multiple ordered Vulkan submissions without waiting on
+ * each finish. Readbacks and guest synchronization still drain as required. */
+void pgraph_vk_wait_graphics_batches(PGRAPHVkState *r);
+void pgraph_vk_wait_graphics_batch(PGRAPHVkState *r, unsigned int batch);
+void pgraph_vk_mark_vertex_pages(PGRAPHVkState *r, hwaddr addr, hwaddr size);
+void pgraph_vk_wait_vertex_writes(PGRAPHVkState *r, hwaddr addr, hwaddr size);
+void pgraph_vk_save_batch_state(PGRAPHVkState *r);
+
 // buffer.c
+void pgraph_vk_init_batch_stream_buffers(NV2AState *d);
 void pgraph_vk_init_buffers(NV2AState *d);
 void pgraph_vk_finalize_buffers(NV2AState *d);
 TextureUploadSlice pgraph_vk_reserve_texture_upload(PGRAPHState *pg,

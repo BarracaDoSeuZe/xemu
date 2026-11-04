@@ -108,6 +108,7 @@ static void pipeline_cache_entry_post_evict(Lru *lru, LruNode *node)
             snode->draw_time < r->command_buffer_start_time) &&
            "Pipeline evicted while in use!");
 
+    pgraph_vk_wait_graphics_batches(r);
     vkDestroyPipeline(r->device, snode->pipeline, NULL);
     snode->pipeline = VK_NULL_HANDLE;
 
@@ -269,8 +270,11 @@ void pgraph_vk_init_pipelines(PGRAPHState *pg)
     VkFenceCreateInfo fence_info = {
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
     };
-    VK_CHECK(
-        vkCreateFence(r->device, &fence_info, NULL, &r->command_buffer_fence));
+    for (unsigned int i = 0; i < XEMU_VK_BATCH_COUNT; ++i) {
+        VK_CHECK(vkCreateFence(r->device, &fence_info, NULL,
+                                &r->batches[i].fence));
+    }
+    r->command_buffer_fence = r->batches[0].fence;
 }
 
 void pgraph_vk_finalize_pipelines(PGRAPHState *pg)
@@ -281,7 +285,11 @@ void pgraph_vk_finalize_pipelines(PGRAPHState *pg)
     finalize_pipeline_cache(pg);
     finalize_render_passes(r);
 
-    vkDestroyFence(r->device, r->command_buffer_fence, NULL);
+    for (unsigned int i = 0; i < XEMU_VK_BATCH_COUNT; ++i) {
+        vkDestroyFence(r->device, r->batches[i].fence, NULL);
+        r->batches[i].fence = VK_NULL_HANDLE;
+    }
+    r->command_buffer_fence = VK_NULL_HANDLE;
 }
 
 static void init_render_pass_state(PGRAPHState *pg, RenderPassState *state)
@@ -1100,7 +1108,7 @@ static void bind_descriptor_sets(PGRAPHState *pg)
 
     vkCmdBindDescriptorSets(r->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             r->pipeline_binding->layout, 0, 1,
-                            &r->descriptor_sets[r->descriptor_set_index - 1], 0,
+                            &r->descriptor_sets[r->active_batch][r->descriptor_set_index - 1], 0,
                             NULL);
 }
 
@@ -1260,16 +1268,151 @@ const enum NV2A_PROF_COUNTERS_ENUM finish_reason_to_counter_enum[] = {
     [VK_FINISH_REASON_STALLED] = NV2A_PROF_FINISH_STALLED,
 };
 
+/* V17: Two submitted graphics batches can coexist on one Vulkan queue.
+ * VkQueue submission order provides execution order. CPU resource reuse is
+ * controlled by the fence of the batch that originally owns the resource. */
+static const int graphics_stream_indices[] = {
+    BUFFER_INDEX, BUFFER_INDEX_STAGING,
+    BUFFER_VERTEX_INLINE, BUFFER_VERTEX_INLINE_STAGING,
+    BUFFER_UNIFORM, BUFFER_UNIFORM_STAGING,
+};
+
+void pgraph_vk_wait_graphics_batch(PGRAPHVkState *r, unsigned int batch)
+{
+    assert(batch < XEMU_VK_BATCH_COUNT);
+    VkGraphicsBatchSlot *slot = &r->batches[batch];
+    if (slot->pending) {
+        VK_CHECK(vkWaitForFences(r->device, 1, &slot->fence,
+                                 VK_TRUE, UINT64_MAX));
+        slot->pending = false;
+    }
+}
+
+void pgraph_vk_wait_graphics_batches(PGRAPHVkState *r)
+{
+    for (unsigned int i = 0; i < XEMU_VK_BATCH_COUNT; i++) {
+        pgraph_vk_wait_graphics_batch(r, i);
+    }
+}
+
+/* The shared 64MiB host-visible Xbox VRAM mirror is read by GPU vertex
+ * fetches. Wait only when the CPU attempts to overwrite a page referenced
+ * by a submitted batch; otherwise no GPU/CPU stall is required. */
+void pgraph_vk_mark_vertex_pages(PGRAPHVkState *r, hwaddr addr, hwaddr size)
+{
+    if (!size) {
+        return;
+    }
+    size_t first = addr / TARGET_PAGE_SIZE;
+    size_t last = TARGET_PAGE_ALIGN(addr + size) / TARGET_PAGE_SIZE;
+    assert(last <= r->bitmap_size);
+    bitmap_set(r->batches[r->active_batch].vertex_pages, first, last - first);
+}
+
+void pgraph_vk_wait_vertex_writes(PGRAPHVkState *r, hwaddr addr, hwaddr size)
+{
+    if (!size) {
+        return;
+    }
+    size_t first = addr / TARGET_PAGE_SIZE;
+    size_t last = TARGET_PAGE_ALIGN(addr + size) / TARGET_PAGE_SIZE;
+    assert(last <= r->bitmap_size);
+    for (unsigned int i = 0; i < XEMU_VK_BATCH_COUNT; i++) {
+        VkGraphicsBatchSlot *slot = &r->batches[i];
+        if (slot->pending &&
+            find_next_bit(slot->vertex_pages, last, first) < last) {
+            pgraph_vk_wait_graphics_batch(r, i);
+        }
+    }
+}
+
+void pgraph_vk_save_batch_state(PGRAPHVkState *r)
+{
+    VkGraphicsBatchSlot *slot = &r->batches[r->active_batch];
+    for (unsigned int i = 0; i < ARRAY_SIZE(graphics_stream_indices); i++) {
+        int idx = graphics_stream_indices[i];
+        slot->stream_buffers[idx] = r->storage_buffers[idx];
+    }
+    memcpy(slot->framebuffers, r->framebuffers, sizeof(r->framebuffers));
+    slot->framebuffer_index = r->framebuffer_index;
+    slot->descriptor_set_index = r->descriptor_set_index;
+    slot->upload_chunks = r->texture_upload_chunks;
+    slot->upload_tail = r->texture_upload_tail;
+    slot->upload_count = r->texture_uploads_in_batch;
+    slot->upload_bytes = r->texture_upload_bytes_in_batch;
+}
+
+static void load_batch_state(PGRAPHVkState *r, unsigned int batch)
+{
+    VkGraphicsBatchSlot *slot = &r->batches[batch];
+    r->active_batch = batch;
+    r->command_buffer = slot->draw_cmd;
+    r->aux_command_buffer = slot->prelude_cmd;
+    r->command_buffer_fence = slot->fence;
+    for (unsigned int i = 0; i < ARRAY_SIZE(graphics_stream_indices); i++) {
+        int idx = graphics_stream_indices[i];
+        r->storage_buffers[idx] = slot->stream_buffers[idx];
+    }
+    memcpy(r->framebuffers, slot->framebuffers, sizeof(r->framebuffers));
+    r->framebuffer_index = slot->framebuffer_index;
+    r->descriptor_set_index = slot->descriptor_set_index;
+    r->texture_upload_chunks = slot->upload_chunks;
+    r->texture_upload_tail = slot->upload_tail;
+    r->texture_uploads_in_batch = slot->upload_count;
+    r->texture_upload_bytes_in_batch = slot->upload_bytes;
+}
+
+static void activate_next_graphics_batch(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    pgraph_vk_save_batch_state(r);
+    unsigned int next = (r->active_batch + 1) % XEMU_VK_BATCH_COUNT;
+    /* Wait only if all in-flight slots are occupied. */
+    if (r->batches[next].pending) {
+        r->batch_slot_waits++;
+    }
+    pgraph_vk_wait_graphics_batch(r, next);
+    load_batch_state(r, next);
+    VkGraphicsBatchSlot *slot = &r->batches[next];
+    if (slot->submitted) {
+        /* The fence is already complete. The slot can now be recycled. */
+        pgraph_vk_recycle_texture_uploads(pg);
+        destroy_framebuffers(pg);
+        for (unsigned int i = 0; i < ARRAY_SIZE(graphics_stream_indices); i++) {
+            r->storage_buffers[graphics_stream_indices[i]].buffer_offset = 0;
+        }
+        bitmap_clear(slot->vertex_pages, 0, r->bitmap_size);
+        r->descriptor_set_index = 0;
+        slot->submitted = false;
+    }
+    /* State from a previous slot must never be implicitly rebound. */
+    r->framebuffer_dirty = true;
+    r->pipeline_binding_changed = true;
+    r->shader_bindings_changed = true;
+    r->texture_bindings_changed = true;
+    r->uniforms_changed = true;
+}
+
+static bool requires_graphics_completion(PGRAPHVkState *r, FinishReason reason)
+{
+    /* Only a capacity/FB rollover is independent of guest-observable GPU
+     * completion. FLIP_STALL, readback, display and guest flush still wait. */
+    return (reason != VK_FINISH_REASON_NEED_BUFFER_SPACE &&
+            reason != VK_FINISH_REASON_FRAMEBUFFER_DIRTY) ||
+           r->num_queries_in_flight != 0 ||
+           r->compute.descriptor_set_index != 0;
+}
+
 void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
+    bool must_complete = requires_graphics_completion(r, finish_reason);
 
     assert(!r->in_draw);
     assert(r->debug_depth == 0);
 
     if (r->in_command_buffer) {
         nv2a_profile_inc_counter(finish_reason_to_counter_enum[finish_reason]);
-
         if (r->in_render_pass) {
             end_render_pass(r);
         }
@@ -1278,7 +1421,11 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
         }
         VK_CHECK(vkEndCommandBuffer(r->command_buffer));
 
-        VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg); // FIXME: Cleanup
+        /* These copies refer to the *current* slot's persistent buffers.
+         * The prelude may not wait on an unrelated earlier batch. */
+        r->recording_batch_prelude = true;
+        VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
+        r->recording_batch_prelude = false;
         sync_staging_buffer(pg, cmd, BUFFER_INDEX_STAGING, BUFFER_INDEX);
         sync_staging_buffer(pg, cmd, BUFFER_VERTEX_INLINE_STAGING,
                                 BUFFER_VERTEX_INLINE);
@@ -1288,11 +1435,6 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
         VK_CHECK(vkEndCommandBuffer(r->aux_command_buffer));
         r->in_aux_command_buffer = false;
 
-        /* Submit both command buffers as one ordered batch on the same
-         * Vulkan queue.  The transfer->vertex/uniform pipeline barriers
-         * recorded in the prelude cover later drawing commands as well;
-         * a binary semaphore between two submissions to this *same* queue
-         * added driver overhead without a separate cross-queue dependency. */
         VkCommandBuffer ordered_commands[] = {
             r->aux_command_buffer,
             r->command_buffer,
@@ -1302,49 +1444,70 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
             .commandBufferCount = ARRAY_SIZE(ordered_commands),
             .pCommandBuffers = ordered_commands,
         };
+        VkGraphicsBatchSlot *slot = &r->batches[r->active_batch];
+        assert(!slot->submitted);
+        VK_CHECK(vkResetFences(r->device, 1, &slot->fence));
         nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT);
-        VK_CHECK(vkResetFences(r->device, 1, &r->command_buffer_fence));
-        VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info,
-                               r->command_buffer_fence));
-        r->submit_count += 1;
+        VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info, slot->fence));
+        slot->pending = slot->submitted = true;
+        r->submit_count++;
 
-        bool check_budget = false;
-
-        // Periodically check memory budget
         const int max_num_submits_before_budget_update = 5;
         if (finish_reason == VK_FINISH_REASON_FLIP_STALL ||
             (r->submit_count - r->allocator_last_submit_index) >
                 max_num_submits_before_budget_update) {
-
-            // VMA queries budget via vmaSetCurrentFrameIndex
             vmaSetCurrentFrameIndex(r->allocator, r->submit_count);
             r->allocator_last_submit_index = r->submit_count;
-            check_budget = true;
         }
-
-        VK_CHECK(vkWaitForFences(r->device, 1, &r->command_buffer_fence,
-                                 VK_TRUE, UINT64_MAX));
-
-        /* The submitted graphics batch has finished; its texture staging
-         * slices can safely be reused by the next batch. */
-        pgraph_vk_recycle_texture_uploads(pg);
-        r->descriptor_set_index = 0;
         r->in_command_buffer = false;
-
-        // The submitted batch is no longer pending. Keep surface timestamps
-        // distinct from the next batch to avoid an unnecessary GPU wait.
         pg->draw_time++;
-        destroy_framebuffers(pg);
 
-        if (check_budget) {
-            pgraph_vk_check_memory_budget(pg);
+        if (must_complete) {
+            pgraph_vk_wait_graphics_batches(r);
+        } else {
+            r->deferred_batch_submits++;
         }
+        /* Do not process occlusion queries until their submit has completed. */
+        NV2AState *d = container_of(pg, NV2AState, pgraph);
+        if (r->num_queries_in_flight || !QSIMPLEQ_EMPTY(&r->report_queue)) {
+            pgraph_vk_wait_graphics_batches(r);
+        }
+        pgraph_vk_process_pending_reports_internal(d);
+        if (r->compute.descriptor_set_index) {
+            pgraph_vk_wait_graphics_batches(r);
+        }
+        pgraph_vk_compute_finish_complete(r);
+
+        activate_next_graphics_batch(pg);
+        /* Diagnostics only: count actually deferred submissions and ring
+         * slot waits. No per-frame log traffic by default. */
+        static int stats_enabled = -1;
+        if (stats_enabled < 0) {
+            const char *flag = getenv("XEMU_VK_BATCH_STATS");
+            stats_enabled = flag && !strcmp(flag, "1");
+        }
+        if (stats_enabled && r->submit_count % 256 == 0) {
+            fprintf(stderr,
+                    "xemu/vk: V17 submits %u, deferred %llu, "
+                    "slot waits %llu\n",
+                    r->submit_count,
+                    (unsigned long long)r->deferred_batch_submits,
+                    (unsigned long long)r->batch_slot_waits);
+        }
+    } else {
+        if (must_complete) {
+            pgraph_vk_wait_graphics_batches(r);
+        }
+        NV2AState *d = container_of(pg, NV2AState, pgraph);
+        if (r->num_queries_in_flight || !QSIMPLEQ_EMPTY(&r->report_queue)) {
+            pgraph_vk_wait_graphics_batches(r);
+        }
+        pgraph_vk_process_pending_reports_internal(d);
+        if (r->compute.descriptor_set_index) {
+            pgraph_vk_wait_graphics_batches(r);
+        }
+        pgraph_vk_compute_finish_complete(r);
     }
-
-    NV2AState *d = container_of(pg, NV2AState, pgraph);
-    pgraph_vk_process_pending_reports_internal(d);
-
-    pgraph_vk_compute_finish_complete(r);
 }
 
 void pgraph_vk_begin_command_buffer(PGRAPHState *pg)

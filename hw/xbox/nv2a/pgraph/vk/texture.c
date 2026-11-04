@@ -1558,6 +1558,7 @@ static void texture_cache_entry_post_evict(Lru *lru, LruNode *node)
 {
     PGRAPHVkState *r = container_of(lru, PGRAPHVkState, texture_cache);
     TextureBinding *snode = container_of(node, TextureBinding, node);
+    pgraph_vk_wait_graphics_batches(r);
     texture_cache_release_node_resources(r, snode);
 }
 
