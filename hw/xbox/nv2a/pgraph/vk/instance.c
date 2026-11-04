@@ -558,6 +558,10 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         F(depthClamp, true),
         F(fillModeNonSolid, true),
         F(geometryShader, true),
+        /* VkCmdDrawIndirect may encode several independent DRAW_ARRAYS in
+         * one driver call. This core Vulkan feature is optional: devices
+         * without it retain their original direct draws. */
+        F(multiDrawIndirect, false),
         F(occlusionQueryPrecise, true),
         F(samplerAnisotropy, false),
         F(textureCompressionBC, false),

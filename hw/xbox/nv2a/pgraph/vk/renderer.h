@@ -386,6 +386,10 @@ typedef struct PGRAPHVkState {
     uint64_t deferred_batch_submits;
     uint64_t batch_slot_waits;
 
+    /* V18: Direct versus Vulkan multi-draw calls from NV097_DRAW_ARRAYS. */
+    uint64_t draw_array_source_calls;
+    uint64_t draw_array_vk_calls;
+
     VkCommandBuffer aux_command_buffer;
     VkFence aux_command_buffer_fence;
     bool in_aux_command_buffer;

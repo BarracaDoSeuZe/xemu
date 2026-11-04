@@ -420,7 +420,8 @@ void pgraph_vk_init_buffers(NV2AState *d)
     r->storage_buffers[BUFFER_INDEX] = (StorageBuffer){
         .alloc_info = device_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
         .buffer_size = initial_streaming_capacity(
             r, (VkDeviceSize)sizeof(pg->inline_elements) * 100,
             4 * XEMU_VK_MIB, 16 * XEMU_VK_MIB, 256),

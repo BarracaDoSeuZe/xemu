@@ -266,6 +266,11 @@ void pgraph_vk_init_pipelines(PGRAPHState *pg)
     init_pipeline_cache(pg);
     init_clear_shaders(pg);
     init_render_passes(r);
+    fprintf(stderr, "xemu/vk: V18 multi-draw-indirect %s "
+                    "(max draws/call=%u)\n",
+            r->enabled_physical_device_features.multiDrawIndirect ?
+                "available" : "not supported",
+            r->device_props.limits.maxDrawIndirectCount);
 
     VkFenceCreateInfo fence_info = {
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
@@ -280,6 +285,16 @@ void pgraph_vk_init_pipelines(PGRAPHState *pg)
 void pgraph_vk_finalize_pipelines(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
+
+    const char *batch_stats = getenv("XEMU_VK_DRAW_BATCH_STATS");
+    if (batch_stats && !strcmp(batch_stats, "1")) {
+        fprintf(stderr, "xemu/vk: V18 final DRAW_ARRAYS Vulkan calls "
+                        "%llu/%llu (saved %llu)\n",
+                (unsigned long long)r->draw_array_vk_calls,
+                (unsigned long long)r->draw_array_source_calls,
+                (unsigned long long)(r->draw_array_source_calls -
+                                     r->draw_array_vk_calls));
+    }
 
     finalize_clear_shaders(pg);
     finalize_pipeline_cache(pg);
@@ -1155,6 +1170,12 @@ static void sync_staging_buffer(PGRAPHState *pg, VkCommandBuffer cmd,
         return;
     }
 
+    /* A mapped staging allocation is not necessarily HOST_COHERENT. Flush
+     * before queue submission so the GPU sees the indirect command payload
+     * as well as the existing vertex/index/uniform streaming data. */
+    VK_CHECK(vmaFlushAllocation(r->allocator, b_src->allocation, 0,
+                                b_src->buffer_offset));
+
     VkBufferCopy copy_region = { .size = b_src->buffer_offset };
     vkCmdCopyBuffer(cmd, b_src->buffer, b_dst->buffer, 1, &copy_region);
 
@@ -1163,8 +1184,13 @@ static void sync_staging_buffer(PGRAPHState *pg, VkCommandBuffer cmd,
 
     switch (index_dst) {
     case BUFFER_INDEX:
-        dst_access_mask = VK_ACCESS_INDEX_READ_BIT;
-        dst_stage_mask = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+        /* V18 indirect command arrays share the per-slot index stream. The
+         * prelude copy must be visible to DRAW_INDIRECT as well as to the
+         * original indexed draws, including when both occur in one batch. */
+        dst_access_mask = VK_ACCESS_INDEX_READ_BIT |
+                          VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+        dst_stage_mask = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                         VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
         break;
     case BUFFER_VERTEX_INLINE:
         dst_access_mask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
@@ -1493,6 +1519,21 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
                     r->submit_count,
                     (unsigned long long)r->deferred_batch_submits,
                     (unsigned long long)r->batch_slot_waits);
+        }
+        /* Cumulative A/B counters; no per-draw logging or hot-path IO. */
+        static int draw_batch_stats = -1;
+        if (draw_batch_stats < 0) {
+            const char *flag = getenv("XEMU_VK_DRAW_BATCH_STATS");
+            draw_batch_stats = flag && !strcmp(flag, "1");
+        }
+        if (draw_batch_stats && r->submit_count % 256 == 0) {
+            fprintf(stderr,
+                    "xemu/vk: V18 DRAW_ARRAYS Vulkan calls %llu/%llu "
+                    "(saved %llu)\n",
+                    (unsigned long long)r->draw_array_vk_calls,
+                    (unsigned long long)r->draw_array_source_calls,
+                    (unsigned long long)(r->draw_array_source_calls -
+                                         r->draw_array_vk_calls));
         }
     } else {
         if (must_complete) {
@@ -2292,6 +2333,38 @@ static void copy_remapped_attributes_to_inline_buffer(PGRAPHState *pg,
     buffer->buffer_offset += remap.buffer_space_required;
 }
 
+/* One NV097_BEGIN/END can contain many DRAW_ARRAYS with identical guest
+ * state. Vulkan multiDrawIndirect preserves the individual draw boundaries
+ * while reducing driver dispatches, with no additional per-batch buffer.
+ * The caller already ensured capacity and must not rotate the batch between
+ * this append and recording the corresponding VkCmdDrawIndirect commands. */
+static VkDeviceSize append_draw_arrays_indirect(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    StorageBuffer *staging = &r->storage_buffers[BUFFER_INDEX_STAGING];
+    const uint32_t count = pg->draw_arrays_length;
+    const VkDeviceSize bytes =
+        (VkDeviceSize)count * sizeof(VkDrawIndirectCommand);
+
+    assert(count >= 4);
+    assert(staging->mapped);
+    assert(pgraph_vk_buffer_has_space_for(pg, BUFFER_INDEX_STAGING, bytes, 4));
+
+    VkDeviceSize offset = ROUND_UP(staging->buffer_offset, 4);
+    VkDrawIndirectCommand *commands =
+        (VkDrawIndirectCommand *)(staging->mapped + offset);
+    for (uint32_t i = 0; i < count; i++) {
+        commands[i] = (VkDrawIndirectCommand){
+            .vertexCount = pg->draw_arrays_count[i],
+            .instanceCount = 1,
+            .firstVertex = pg->draw_arrays_start[i],
+            .firstInstance = 0,
+        };
+    }
+    staging->buffer_offset = offset + bytes;
+    return offset;
+}
+
 void pgraph_vk_flush_draw(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -2324,18 +2397,69 @@ void pgraph_vk_flush_draw(NV2AState *d)
         sync_vertex_ram_buffer(pg);
         VertexBufferRemap remap = remap_unaligned_attributes(pg, max_element);
 
+        /* Unlike merging triangle strips with primitive restart, Vulkan
+         * multi-draw-indirect preserves the per-draw primitive boundaries,
+         * gl_VertexIndex values and instance/draw parameters. All these
+         * DRAW_ARRAYS already share one guest BEGIN/END and pipeline state.
+         * Do not incur an extra transfer for only one or two commands. */
+        const uint32_t draw_count = pg->draw_arrays_length;
+        const bool batch_draw_arrays =
+            r->enabled_physical_device_features.multiDrawIndirect &&
+            r->device_props.limits.maxDrawIndirectCount > 1 &&
+            draw_count >= 4;
+        const VkDeviceSize indirect_bytes =
+            (VkDeviceSize)draw_count * sizeof(VkDrawIndirectCommand);
+        if (batch_draw_arrays) {
+            ensure_buffer_space(pg, BUFFER_INDEX_STAGING, indirect_bytes);
+        }
+
         begin_pre_draw(pg);
+
+        /* Descriptor exhaustion may rotate the V17 slot in begin_pre_draw.
+         * If so, recheck the *new* slot before writing its command stream. */
+        if (batch_draw_arrays &&
+            !pgraph_vk_buffer_has_space_for(pg, BUFFER_INDEX_STAGING,
+                                            indirect_bytes, 4)) {
+            pgraph_vk_finish(pg, VK_FINISH_REASON_NEED_BUFFER_SPACE);
+            ensure_buffer_space(pg, BUFFER_INDEX_STAGING, indirect_bytes);
+            begin_pre_draw(pg);
+        }
+
+        VkDeviceSize indirect_offset = 0;
+        if (batch_draw_arrays) {
+            indirect_offset = append_draw_arrays_indirect(pg);
+        }
+
         copy_remapped_attributes_to_inline_buffer(pg, remap, min_element,
                                                   max_element);
         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
                                      "Draw Arrays");
         begin_draw(pg);
         bind_vertex_buffer(pg, remap.attributes, 0);
-        for (int i = 0; i < pg->draw_arrays_length; i++) {
-            uint32_t start = pg->draw_arrays_start[i],
-                     count = pg->draw_arrays_count[i];
-            NV2A_VK_DPRINTF("- [%d] Start:%d Count:%d", i, start, count);
-            vkCmdDraw(r->command_buffer, count, 1, start, 0);
+        r->draw_array_source_calls += draw_count;
+        if (batch_draw_arrays) {
+            uint32_t first = 0;
+            const uint32_t max_per_call =
+                r->device_props.limits.maxDrawIndirectCount;
+            while (first < draw_count) {
+                uint32_t n = MIN(max_per_call, draw_count - first);
+                vkCmdDrawIndirect(r->command_buffer,
+                                  r->storage_buffers[BUFFER_INDEX].buffer,
+                                  indirect_offset +
+                                      (VkDeviceSize)first *
+                                          sizeof(VkDrawIndirectCommand),
+                                  n, sizeof(VkDrawIndirectCommand));
+                r->draw_array_vk_calls++;
+                first += n;
+            }
+        } else {
+            for (uint32_t i = 0; i < draw_count; i++) {
+                uint32_t start = pg->draw_arrays_start[i],
+                         count = pg->draw_arrays_count[i];
+                NV2A_VK_DPRINTF("- [%u] Start:%u Count:%u", i, start, count);
+                vkCmdDraw(r->command_buffer, count, 1, start, 0);
+                r->draw_array_vk_calls++;
+            }
         }
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
